@@ -18,6 +18,22 @@ public class CefWrapper : IDisposable
     private Thread RenderWatchdog;
     private DateTime lastPaint = DateTime.MinValue;
 
+    // D-15b: conditional one-shot smoke seam. OnBrowserPaint is private and the upstream send
+    // is continuous (gated only on Program.NdiSenderPtr != Zero), so "exactly one send" cannot
+    // be hooked from Program — the latch must live here. It is ARMED only under --smoke; on the
+    // normal --url= path SmokeMode stays false and the continuous-send path is byte-for-byte
+    // upstream (D-05).
+    public bool SmokeMode { get; set; }
+    private bool smokeSent;
+    private readonly TaskCompletionSource<bool> smokeFrameSent =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// Completes when exactly one non-blank frame has been sent under --smoke (D-15b).
+    /// Only meaningful when <see cref="SmokeMode"/> is true.
+    /// </summary>
+    public Task SmokeFrameSent => this.smokeFrameSent.Task;
+
     public CefWrapper(int width, int height, string initialUrl)
     {
         this.Width = width;
@@ -79,6 +95,24 @@ public class CefWrapper : IDisposable
 
         this.lastPaint = DateTime.Now;
 
+        // D-15b: one-shot smoke latch. Under --smoke we send EXACTLY ONE non-blank frame, then
+        // signal completion and suppress all further sends. A black/all-zero first paint does
+        // NOT count as the one good frame (D-15c blank-buffer guard). On the normal path
+        // (SmokeMode == false) this whole block is skipped and the send below is unchanged.
+        if (this.SmokeMode)
+        {
+            if (this.smokeSent)
+            {
+                return;
+            }
+
+            if (IsBlankBuffer(e.BufferHandle, e.Width, e.Height))
+            {
+                // Not a usable frame yet — wait for a non-blank paint (the watchdog re-invalidates).
+                return;
+            }
+        }
+
         var videoFrame = new NDIlib.video_frame_v2_t()
         {
             FourCC = NDIlib.FourCC_type_e.FourCC_type_BGRA,
@@ -94,6 +128,50 @@ public class CefWrapper : IDisposable
         };
 
         NDIlib.send_send_video_v2(Program.NdiSenderPtr, ref videoFrame);
+
+        if (this.SmokeMode && !this.smokeSent)
+        {
+            this.smokeSent = true;
+            this.smokeFrameSent.TrySetResult(true);
+        }
+    }
+
+    /// <summary>
+    /// D-15c: cheap non-blank check over the BGRA paint buffer — true if the sampled pixels are
+    /// effectively all-black (so a never-painting SwiftShader init does not count as a good frame).
+    /// Samples a sparse stride to stay O(1)-ish on a 1080p buffer.
+    /// </summary>
+    private static unsafe bool IsBlankBuffer(nint buffer, int width, int height)
+    {
+        if (buffer == nint.Zero || width <= 0 || height <= 0)
+        {
+            return true;
+        }
+
+        var bytesPerPixel = 4; // BGRA
+        long totalPixels = (long)width * height;
+        // Sample ~4096 pixels evenly across the frame.
+        long step = Math.Max(1, totalPixels / 4096);
+        var ptr = (byte*)buffer;
+        long nonBlack = 0;
+
+        for (long i = 0; i < totalPixels; i += step)
+        {
+            long off = i * bytesPerPixel;
+            byte b = ptr[off + 0];
+            byte g = ptr[off + 1];
+            byte r = ptr[off + 2];
+
+            // Rec.601-ish luma; broadcast-black threshold (~8% of 255).
+            int luma = (299 * r + 587 * g + 114 * b) / 1000;
+            if (luma > 20)
+            {
+                nonBlack++;
+            }
+        }
+
+        // Require a meaningful fraction of sampled pixels to be non-black.
+        return nonBlack < 16;
     }
 
     protected virtual void Dispose(bool disposing)

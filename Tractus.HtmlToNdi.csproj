@@ -45,4 +45,43 @@
     </None>
   </ItemGroup>
 
+  <!-- D-13: embed the fork SHA as assembly metadata at build time so the provenance stamp can
+       report it even from a published bundle (which has no .git). Falls back to "unknown" if git
+       is unavailable. Read at runtime via AssemblyMetadataAttribute (key "ForkSha"). -->
+  <Target Name="SetForkSha" BeforeTargets="CoreCompile">
+    <Exec Command="git rev-parse --short HEAD"
+          ConsoleToMsBuild="true"
+          ContinueOnError="true"
+          WorkingDirectory="$(MSBuildProjectDirectory)">
+      <Output TaskParameter="ConsoleOutput" PropertyName="ForkShaOut" />
+      <Output TaskParameter="ExitCode" PropertyName="ForkShaExit" />
+    </Exec>
+    <PropertyGroup>
+      <ForkSha Condition="'$(ForkShaExit)' == '0'">$(ForkShaOut)</ForkSha>
+      <ForkSha Condition="'$(ForkSha)' == ''">unknown</ForkSha>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyMetadata Include="ForkSha" Value="$(ForkSha)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- D-02: vendor the NDI native runtime DLL beside the exe so the FORK-03 bundle is
+       zero-install and CI needs no NDI SDK install. NDILibDotNetCoreBase does NOT ship the
+       native DLL; it resolves Processing.NDI.Lib.x64.dll from the app launch path. -->
+  <ItemGroup>
+    <None Include="nativedeps\Processing.NDI.Lib.x64.dll">
+      <!-- Link flattens the file to the output ROOT (beside the exe) — NDILibDotNetCoreBase
+           resolves the native lib from the app launch path, not a subfolder. -->
+      <Link>Processing.NDI.Lib.x64.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- D-05/D-15: the smoke self-check loads this committed local HTML by default. -->
+  <ItemGroup>
+    <None Update="smoke\smoke.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

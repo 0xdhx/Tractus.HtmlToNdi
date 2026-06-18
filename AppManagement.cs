@@ -62,6 +62,43 @@ public static class AppManagement
 
     public static string Version => Assembly.GetExecutingAssembly()?.GetName()?.Version?.ToString() ?? "0.0.0.0";
 
+    // D-13: provenance — the pinned NDI managed wrapper version (matches the csproj
+    // NDILibDotNetCoreBase pin; D-04). Recorded so logs answer "which NDI is this bundle".
+    public const string NdiWrapperVersion = "2024.7.22.1";
+
+    /// <summary>
+    /// D-13: the fork SHA, embedded at build time via the SetForkSha MSBuild target
+    /// (AssemblyMetadata key "ForkSha"). Survives a published bundle that has no .git.
+    /// </summary>
+    public static string ForkSha
+    {
+        get
+        {
+            var meta = Assembly.GetExecutingAssembly()
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(a => a.Key == "ForkSha");
+
+            var value = meta?.Value;
+            return string.IsNullOrWhiteSpace(value) ? "unknown" : value.Trim();
+        }
+    }
+
+    /// <summary>
+    /// D-13: emit the provenance stamp on BOTH --smoke and normal startup. Records app version,
+    /// the CefSharp package version, the pinned NDI wrapper version, and the fork SHA — so
+    /// "which CEF/fork/NDI is this bundle?" is answerable from the logs (the drift canary).
+    /// </summary>
+    public static void LogProvenance()
+    {
+        Log.Information(
+            "PROVENANCE app={AppName} v{AppVersion} | CefSharp={CefSharpVersion} | NDIwrapper={NdiWrapper} | fork={ForkSha}",
+            AppName,
+            Version,
+            CefSharp.Cef.CefSharpVersion,
+            NdiWrapperVersion,
+            ForkSha);
+    }
+
     public static string InstanceName
     {
         get

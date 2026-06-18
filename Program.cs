@@ -28,6 +28,16 @@ public class Program
         Directory.SetCurrentDirectory(exeDirectory);
         AppManagement.Initialize(args);
 
+        // D-15a: detect --smoke BEFORE the interactive --ndiname/--port prompts below (both call
+        // Console.ReadLine() when their arg is absent, which would HANG a headless CI run with no
+        // stdin). The smoke path sets its own defaults and short-circuits the whole normal flow
+        // (interactive prompts + ASP.NET host + KVM thread). The normal --url= path is unchanged.
+        if (args.Any(x => x.StartsWith("--smoke")))
+        {
+            RunSmoke(args, launchCachePath);
+            return; // unreachable — RunSmoke always calls Environment.Exit.
+        }
+
         var ndiName = "HTML5";
         if (args.Any(x => x.StartsWith("--ndiname")))
         {
@@ -147,6 +157,9 @@ public class Program
 
             await browserWrapper.InitializeWrapperAsync();
         });
+
+        // D-13: provenance stamp on normal startup (CEF is initialized so CefSharpVersion is valid).
+        AppManagement.LogProvenance();
 
         var builder = WebApplication.CreateBuilder(args);
 
@@ -298,5 +311,125 @@ public class Program
 
             }
         }
+    }
+
+    /// <summary>
+    /// D-05/D-15: additive in-process --smoke self-check. Initializes CEF, loads a tiny committed
+    /// local HTML (or --smoke=&lt;url&gt;), captures one NON-BLANK OnPaint via the conditional
+    /// CefWrapper one-shot latch, creates the NDI sender, sends EXACTLY ONE frame, logs the
+    /// provenance stamp, prints "SMOKE OK" and exits 0 — WITHOUT starting the ASP.NET host or the
+    /// KVM thread. A hard ~20s timeout (D-15c) makes a never-painting init fail fast (non-zero).
+    /// The normal --url= path never reaches here, so it stays byte-for-byte upstream (D-05).
+    /// </summary>
+    private static void RunSmoke(string[] args, string launchCachePath)
+    {
+        const int SmokeTimeoutSeconds = 20;
+
+        // D-15a: smoke defaults — no interactive prompts, no stdin dependency.
+        var ndiName = "XPRESSION-SMOKE";
+        var width = 1920;
+        var height = 1080;
+
+        // --smoke or --smoke=<url>. Default to the committed local smoke HTML beside the exe.
+        var smokeArg = args.FirstOrDefault(x => x.StartsWith("--smoke")) ?? "--smoke";
+        string smokeUrl;
+        var eq = smokeArg.IndexOf('=');
+        if (eq >= 0 && eq < smokeArg.Length - 1)
+        {
+            smokeUrl = smokeArg.Substring(eq + 1);
+        }
+        else
+        {
+            var localHtml = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "smoke", "smoke.html");
+            smokeUrl = new Uri(localHtml).AbsoluteUri; // file:///.../smoke/smoke.html
+        }
+
+        Log.Information("SMOKE starting — url={SmokeUrl} timeout={Timeout}s", smokeUrl, SmokeTimeoutSeconds);
+
+        var exitCode = 1; // default to failure; only set 0 on the success path.
+
+        try
+        {
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+
+                // D-13: provenance stamp on the smoke path too (CEF now initialized).
+                AppManagement.LogProvenance();
+
+                browserWrapper = new CefWrapper(width, height, smokeUrl)
+                {
+                    SmokeMode = true, // D-15b: arm the one-shot latch.
+                };
+
+                await browserWrapper.InitializeWrapperAsync();
+
+                // Behavior 2: create the NDI sender; nint.Zero ⇒ wrong/missing NDI DLL ⇒ fail.
+                var settings_T = new NDIlib.send_create_t
+                {
+                    p_ndi_name = UTF.StringToUtf8(ndiName)
+                };
+                Program.NdiSenderPtr = NDIlib.send_create(ref settings_T);
+
+                if (Program.NdiSenderPtr == nint.Zero)
+                {
+                    Log.Error("SMOKE FAILED — NDIlib.send_create returned nint.Zero (NDI native DLL missing or wrong).");
+                    return; // exitCode stays 1
+                }
+
+                // Behaviors 1/3: wait for EXACTLY ONE non-blank frame, bounded by the hard timeout.
+                var sentTask = browserWrapper.SmokeFrameSent;
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(SmokeTimeoutSeconds));
+                var winner = await Task.WhenAny(sentTask, timeoutTask);
+
+                if (winner != sentTask)
+                {
+                    Log.Error("SMOKE FAILED — no non-blank frame within {Timeout}s (never-painting init).", SmokeTimeoutSeconds);
+                    return; // exitCode stays 1
+                }
+
+                Log.Information("SMOKE OK — one non-blank BGRA frame sent through the vendored NDI DLL.");
+                Console.WriteLine("SMOKE OK");
+                exitCode = 0;
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("SMOKE FAILED — exception during smoke: {@ex}", ex);
+            exitCode = 1;
+        }
+        finally
+        {
+            try
+            {
+                browserWrapper?.Dispose();
+            }
+            catch
+            {
+            }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try
+                {
+                    Directory.Delete(launchCachePath, true);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
     }
 }

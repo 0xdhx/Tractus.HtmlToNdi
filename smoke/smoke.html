@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HtmlToNdi Smoke</title>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    /* Solid, non-blank, full-viewport fill so the --smoke luma check sees a clearly
+       non-black frame on the very first paint (SwiftShader-safe: no GPU/WebGL needed). */
+    #fill {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: #1ec873; /* bright green — high luma, unambiguously non-blank */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: sans-serif;
+      font-size: 6vh;
+      color: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div id="fill">SMOKE</div>
+</body>
+</html>
