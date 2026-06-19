@@ -1,6 +1,8 @@
 
 using CefSharp;
 using CefSharp.OffScreen;
+using Serilog;
+using Tractus.HtmlToNdi.Chromium.Inject;
 
 namespace Tractus.HtmlToNdi.Chromium;
 
@@ -13,6 +15,40 @@ public class CefWrapper : IDisposable, IFrameSource
     public int Height { get; private set; }
 
     public string? Url { get; private set; }
+
+    /// <summary>
+    /// D-16: the start URL is STORED here (not passed to the ctor) so the browser is constructed with
+    /// <c>about:blank</c> and the first REAL navigation is deferred until AFTER the doc-start script is
+    /// registered (register-before-Load — Pitfall 1). The current upstream ctor auto-loaded
+    /// <c>initialUrl</c> immediately, which made "register before the first Load" impossible.
+    /// </summary>
+    private readonly string startUrl;
+
+    /// <summary>
+    /// D-15/D-04: the inject hook owning the persistent DevToolsClient + the tracked doc-start script id
+    /// + the fail-closed swap. Constructed in <see cref="InitializeWrapperAsync"/> (needs the live
+    /// browser). The startup recipe to register before the first Load is set via
+    /// <see cref="StartupRecipe"/>.
+    /// </summary>
+    private InjectHook? injectHook;
+
+    /// <summary>
+    /// The recipe resolved at startup (D-16 two-phase resolution, set by Program before
+    /// <see cref="InitializeWrapperAsync"/>). May be <c>null</c> (D-07 pass-through). Becomes the initial
+    /// <see cref="CurrentRecipe"/>.
+    /// </summary>
+    public Recipe? StartupRecipe { get; set; }
+
+    /// <summary>
+    /// The recipe currently driving injection (consumed by the <c>/recipe</c> GET endpoint, Plan 04
+    /// Task 3). Updated by <see cref="SwapRecipeAsync"/>. <c>null</c> = pass-through (no injection).
+    /// </summary>
+    public Recipe? CurrentRecipe { get; private set; }
+
+    /// <summary>
+    /// The live browser handle (D-17 — <see cref="InjectHook"/> reaches the DevTools client through it).
+    /// </summary>
+    internal ChromiumWebBrowser? Browser => this.browser;
 
     private Thread RenderWatchdog;
     private DateTime lastPaint = DateTime.MinValue;
@@ -52,12 +88,22 @@ public class CefWrapper : IDisposable, IFrameSource
         this.Height = height;
         this.Url = initialUrl;
 
-        this.browser = new ChromiumWebBrowser(initialUrl)
+        // D-16: store the start URL for a DEFERRED first Load; construct on about:blank so NO real
+        // document is created before the doc-start CDP script can register (the upstream ctor passed
+        // initialUrl straight to the browser, auto-loading it immediately — the D-16 root cause).
+        this.startUrl = initialUrl;
+
+        this.browser = new ChromiumWebBrowser("about:blank")
         {
             AudioHandler = new CustomAudioHandler(),
         };
 
         this.browser.Size = new System.Drawing.Size(this.Width, this.Height);
+
+        // D-11/D-27: thin belt-and-suspenders re-assert — re-apply the FULL recipe Css ONLY at the
+        // start of every frame load (never consent/JS through this path). Wired here so it survives
+        // browser recreate (re-wired in RecreateBrowserCoreAsync).
+        this.browser.FrameLoadStart += this.OnFrameLoadStart;
 
         this.RenderWatchdog = new Thread(this.RenderWatchDogThread);
     }
@@ -82,6 +128,8 @@ public class CefWrapper : IDisposable, IFrameSource
             return;
         }
 
+        // Resolves the about:blank load (D-16) — NOT a real document, so nothing the recipe targets has
+        // rendered yet. Registration below therefore precedes the first real Load.
         await this.browser.WaitForInitialLoadAsync();
 
         this.browser.GetBrowserHost().WindowlessFrameRate = 60;
@@ -89,6 +137,75 @@ public class CefWrapper : IDisposable, IFrameSource
 
         this.browser.Paint += this.OnBrowserPaint;
         this.RenderWatchdog.Start();
+
+        // D-13: force the offscreen surface visible so Chromium does not report it hidden and halt
+        // requestAnimationFrame (the anti-throttle CefCommandLineArgs are set process-globally at
+        // Cef.Initialize in Program; this is the per-browser visibility lever).
+        this.ForceVisible();
+
+        // D-15/D-16: acquire the persistent DevToolsClient + Page.enable, register the startup recipe's
+        // doc-start script, THEN Load(startUrl) — so the FIRST real document is injected (Pitfall 1).
+        this.CurrentRecipe = this.StartupRecipe;
+        this.injectHook = new InjectHook(this);
+        await this.injectHook.EnsureClientAsync();
+        await this.injectHook.RegisterRecipeAsync(this.StartupRecipe);
+
+        // The deferred first real navigation (D-16) — register-before-Load satisfied by construction.
+        this.Url = this.startUrl;
+        this.browser.Load(this.startUrl);
+    }
+
+    /// <summary>
+    /// D-13 force-visible: tell the host the surface is NOT hidden + take focus, then (best-effort) the
+    /// CDP focus-emulation lever, so a surface that would otherwise report hidden does not throttle rAF.
+    /// </summary>
+    private void ForceVisible()
+    {
+        try
+        {
+            var host = this.browser?.GetBrowserHost();
+            if (host is null)
+            {
+                return;
+            }
+
+            host.WasHidden(false);
+            host.SendFocusEvent(true);
+        }
+        catch
+        {
+            // best-effort — never let a visibility lever fail startup.
+        }
+    }
+
+    /// <summary>
+    /// D-11/D-27 belt-and-suspenders: at the start of every frame load, re-assert the FULL
+    /// <see cref="CurrentRecipe"/> Css ONLY (the flat recipe has only css — there is NO separate
+    /// hideChromeCss subset field). NEVER injects consent/JS through this path (that is the doc-start
+    /// CDP script's job, D-15). A null recipe / null css is a no-op (D-07 pass-through).
+    /// </summary>
+    private void OnFrameLoadStart(object? sender, FrameLoadStartEventArgs e)
+    {
+        var css = this.CurrentRecipe?.Css;
+        if (string.IsNullOrEmpty(css))
+        {
+            return;
+        }
+
+        try
+        {
+            // Append a <style> node carrying the full recipe css. CSS-only — no consent/JS.
+            var encoded = System.Text.Json.JsonSerializer.Serialize(css);
+            var script =
+                "(function(){try{var s=document.getElementById('__xpn_style_reassert')||document.createElement('style');" +
+                "s.id='__xpn_style_reassert';s.textContent=" + encoded + ";" +
+                "(document.head||document.documentElement).appendChild(s);}catch(e){}})();";
+            e.Frame.ExecuteJavaScriptAsync(script);
+        }
+        catch
+        {
+            // best-effort re-assert — the load-bearing path is the doc-start CDP script.
+        }
     }
 
     private void OnBrowserPaint(object? sender, OnPaintEventArgs e)
@@ -181,9 +298,13 @@ public class CefWrapper : IDisposable, IFrameSource
         {
             if (disposing)
             {
+                this.injectHook?.Dispose();
+                this.injectHook = null;
+
                 if (this.browser is not null)
                 {
                     this.browser.Paint -= this.OnBrowserPaint;
+                    this.browser.FrameLoadStart -= this.OnFrameLoadStart;
                     this.browser.Dispose();
                 }
 
@@ -203,16 +324,110 @@ public class CefWrapper : IDisposable, IFrameSource
         GC.SuppressFinalize(this);
     }
 
-    public void SetUrl(string url)
+    /// <summary>
+    /// D-16: the ASYNC navigation/swap entry that AWAITS doc-start re-registration BEFORE Load — no
+    /// fire-and-forget race (replaces the synchronous upstream <c>void SetUrl</c>). Behavior:
+    /// <list type="bullet">
+    ///   <item>if <paramref name="nextRecipe"/> differs from <see cref="CurrentRecipe"/>, delegate to the
+    ///   fail-closed <see cref="SwapRecipeAsync"/> (re-register BEFORE Load, D-04/D-17);</item>
+    ///   <item>otherwise just await a plain re-Load — the doc-start script re-fires on the new document
+    ///   automatically, no re-registration needed.</item>
+    /// </list>
+    /// Callers resolve the recipe for the new URL (via the store) and pass it in; a <c>null</c> recipe is
+    /// a pass-through (D-07).
+    /// </summary>
+    public async Task SetUrlAsync(string url, Recipe? nextRecipe = null)
     {
         if (this.browser is null)
         {
             return;
         }
 
-        this.Url = url;
+        if (!ReferenceEquals(nextRecipe, this.CurrentRecipe))
+        {
+            // Different recipe → fail-closed swap (re-register before Load). SwapRecipeAsync drives Load.
+            await this.SwapRecipeAsync(nextRecipe, url);
+            return;
+        }
 
+        // Same recipe → the registered doc-start script re-fires on the new document; just navigate.
+        this.Url = url;
         this.browser.Load(url);
+    }
+
+    /// <summary>
+    /// D-04/D-17 fail-closed recipe swap (consumed by the <c>/recipe</c> POST and by
+    /// <see cref="SetUrlAsync"/>). Delegates the CDP remove/re-add to the <see cref="InjectHook"/>
+    /// (Remove-by-tracked-id → re-Add on the persistent client; RecreateBrowserAsync on a Remove
+    /// failure), updates <see cref="CurrentRecipe"/>, THEN Loads the URL — register-before-Load.
+    /// </summary>
+    /// <param name="next">The recipe to swap in (<c>null</c> = pass-through).</param>
+    /// <param name="url">The URL to (re-)load after re-registration; defaults to the current URL.</param>
+    public async Task SwapRecipeAsync(Recipe? next, string? url = null)
+    {
+        if (this.browser is null || this.injectHook is null)
+        {
+            return;
+        }
+
+        await this.injectHook.SwapRecipeAsync(next);
+        this.CurrentRecipe = next;
+
+        var target = url ?? this.Url ?? this.startUrl;
+        this.Url = target;
+        this.browser.Load(target); // register-before-Load: re-registration already awaited above.
+    }
+
+    /// <summary>
+    /// D-17 steps 1–3 + 6 — the browser/paint/sink/smoke half of <see cref="InjectHook.RecreateBrowserAsync"/>
+    /// (the CDP-client half lives in InjectHook). Called ONLY from the fail-closed swap fallback:
+    /// <list type="number">
+    ///   <item>unsubscribe Paint + FrameLoadStart from the old browser;</item>
+    ///   <item>dispose the old browser (its DevTools client was already disposed by InjectHook);</item>
+    ///   <item>recreate the browser on about:blank with the SAME size + audio handler, re-wire Paint +
+    ///   FrameLoadStart, force visible (the D-13 anti-throttle flags are process-global from
+    ///   Cef.Initialize and persist across this recreate);</item>
+    ///   <item>(6) the IFrameSource/NdiFrameSink wiring is PRESERVED automatically — the sink is
+    ///   subscribed to THIS wrapper's <see cref="FrameReady"/> event, not to the browser, so recreating
+    ///   the browser does not orphan it; the smoke latch (SmokeMode/smokeSent/smokeFrameSent) lives on
+    ///   this wrapper and is untouched, so --smoke still completes after a recreate.</item>
+    /// </list>
+    /// InjectHook then re-acquires the DevTools client, re-registers the doc-start script BEFORE Load
+    /// (steps 4–5), and the caller drives Load.
+    /// </summary>
+    internal Task RecreateBrowserCoreAsync()
+    {
+        var old = this.browser;
+        if (old is not null)
+        {
+            old.Paint -= this.OnBrowserPaint;            // step 1
+            old.FrameLoadStart -= this.OnFrameLoadStart; // step 1
+            old.Dispose();                                // step 2
+        }
+
+        // step 3: recreate on about:blank (deferred Load — InjectHook re-registers before the caller Loads).
+        this.browser = new ChromiumWebBrowser("about:blank")
+        {
+            AudioHandler = new CustomAudioHandler(),
+        };
+        this.browser.Size = new System.Drawing.Size(this.Width, this.Height);
+        this.browser.Paint += this.OnBrowserPaint;            // re-wire — preserves the FrameReady→sink path (step 6)
+        this.browser.FrameLoadStart += this.OnFrameLoadStart; // re-wire the D-27 css re-assert
+
+        return this.browser.WaitForInitialLoadAsync().ContinueWith(_ => this.ForceVisible());
+    }
+
+    /// <summary>
+    /// D-25 seam member. The <see cref="IFrameSource"/> contract is "navigate the source to a URL"; this
+    /// wrapper's real navigation is the awaited <see cref="SetUrlAsync(string, Recipe?)"/>. The seam
+    /// caller has no recipe context, so this forwards to a recipe-less re-load (same-recipe path — the
+    /// registered doc-start script re-fires on the new document). Control-plane callers that DO have
+    /// recipe context (the /recipe + /seturl endpoints) use <see cref="SetUrlAsync"/> directly and AWAIT
+    /// re-registration (D-16); this explicit-interface forwarder exists only to satisfy the seam.
+    /// </summary>
+    void IFrameSource.SetUrl(string url)
+    {
+        _ = this.SetUrlAsync(url, this.CurrentRecipe);
     }
 
     public void ScrollBy(int increment)
