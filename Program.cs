@@ -965,7 +965,7 @@ public class Program
     /// <summary>
     /// INJ-04 (D-22): poll a boolean JS expression in the CROSS-ORIGIN IFRAME's OWN execution context,
     /// PER-FRAME. CEF exposes every frame — including a cross-origin OOPIF (site-isolation is OFF for
-    /// this self-check) — through <c>GetBrowser().GetFrames()</c>; we locate the iframe frame by its
+    /// this self-check) — enumerated via <c>GetFrameIdentifiers()</c> + <c>GetFrameByIdentifier()</c>; we locate the iframe frame by its
     /// origin URL and evaluate IN THAT FRAME. Main-frame JS cannot read the iframe's globals, which is
     /// the whole point of the per-frame read.
     /// </summary>
@@ -980,7 +980,7 @@ public class Program
                 {
                     foreach (var id in browser.GetFrameIdentifiers())
                     {
-                        var frame = browser.GetFrame(id);
+                        var frame = browser.GetFrameByIdentifier(id);
                         if (frame is null || frame.IsMain) { continue; }
                         if (frame.Url is null || !frame.Url.StartsWith(iframeOrigin, StringComparison.OrdinalIgnoreCase))
                         {
@@ -988,7 +988,7 @@ public class Program
                         }
 
                         var resp = await frame.EvaluateScriptAsync($"!!({boolExpr})");
-                        if (resp.Success && resp.Result is bool b && b)
+                        if (resp.Success && resp.Result is true)
                         {
                             return true;
                         }
