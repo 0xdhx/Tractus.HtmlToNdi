@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HtmlToNdi Inject Fixture — Cross-Origin IFrame Target</title>
+  <!--
+    D-22 CROSS-ORIGIN IFRAME TARGET. Served by the RunInjectSmoke HTTP listener on a GENUINELY
+    DIFFERENT ORIGIN (a different port) than the main fixture, so under the site-isolation-OFF flags
+    it becomes an OOPIF. The recipe's doc-start injected script runs in THIS frame's OWN execution
+    context (it reaches the iframe only because site isolation is off) and sets
+
+        window.__xpnIframeTargetHit = true
+
+    here. The main page CANNOT read that flag (cross-origin), so RunInjectSmoke reads it via a
+    PER-FRAME DevTools Runtime.evaluate targeting THIS frame's execution context — that per-frame
+    read is the whole point of INJ-04 / D-22.
+
+    The recipe.js identifies the iframe context by the presence of #xpn-iframe-target below (a
+    selector-driven check, no coordinate-clicking).
+  -->
+  <style>
+    html, body { margin: 0; padding: 0; font-family: sans-serif; }
+    body { background: #5c1010; color: #ffffff; }
+    #xpn-iframe-target {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-size: 4vh;
+    }
+  </style>
+</head>
+<body>
+  <!-- The recipe targets this element by selector to confirm it is running INSIDE the iframe, then
+       sets window.__xpnIframeTargetHit in this frame's own context (INJ-04). -->
+  <div id="xpn-iframe-target">CROSS-ORIGIN IFRAME TARGET</div>
+</body>
+</html>

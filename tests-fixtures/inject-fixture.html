@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HtmlToNdi Inject Fixture</title>
+  <!--
+    D-14 SYNTHETIC ACCEPTANCE FIXTURE for the --inject-smoke self-check (Plan 05).
+
+    This is the DETERMINISTIC, CI-runnable proof surface for every Phase-1 inject behavior
+    (INJ-01/03/04/05 + the D-04 swap). AccuWeather remains the Phase-3 LIVE proof; this fixture
+    is the GATE.
+
+    It is served over a LOCAL HTTP LISTENER inside RunInjectSmoke (NOT file://) — D-22 — so the
+    recipe's host urlMatch (localhost) can match, and so the embedded <iframe> can point at a
+    GENUINELY DIFFERENT ORIGIN (a different listener port) and become a real OOPIF under the
+    site-isolation-OFF flags, actually exercising INJ-04. A file:// page + a same-process inline
+    iframe never became an OOPIF and so NEVER tested INJ-04 — that is the explicit reason this
+    design replaces the old one.
+
+    ASSERTION SURFACE (read back by RunInjectSmoke):
+      MAIN frame, all settable from recipe.js via SELECTORS (no coordinate-clicking, INJ-05):
+        window.__injectionSeenBeforeInlineHeadScript  (INJ-01 doc-start-before-inline-head; set by
+                                                        the doc-start harness, read by the inline
+                                                        head race-script and re-exposed)
+        window.__inlineHeadSawMarker                   (the INJ-01 race outcome: did the inline head
+                                                        script observe the marker ALREADY set)
+        window.consentDismissed                        (INJ-05 / INJ-03)
+        window.consentRemounted                        (INJ-03 re-mount trigger fired)
+        window.chromeHidden                            (INJ-05)
+        window.targetFilled                            (INJ-05)
+        window.playStarted                             (INJ-05)
+      CROSS-ORIGIN IFRAME's OWN context (read PER-FRAME via DevTools Runtime.evaluate — main-frame
+      JS cannot read it, D-22):
+        window.__xpnIframeTargetHit                    (INJ-04)
+  -->
+
+  <!--
+    INLINE HEAD RACE SCRIPT (INJ-01). This runs as early as the page itself can run a script. The
+    doc-start injected harness (Page.addScriptToEvaluateOnNewDocument) runs BEFORE this, so when
+    this inline script executes, window.__injectionSeenBeforeInlineHeadScript MUST already be true.
+    We record the race outcome so RunInjectSmoke can assert document-start ordering deterministically.
+  -->
+  <script>
+    (function () {
+      // The doc-start harness sets window.__injectionSeenBeforeInlineHeadScript === true as its
+      // FIRST statement. If the injection truly ran at document-start, it is already set here.
+      window.__inlineHeadSawMarker = (window.__injectionSeenBeforeInlineHeadScript === true);
+    })();
+  </script>
+
+  <style>
+    html, body { margin: 0; padding: 0; font-family: sans-serif; }
+    /* Solid, non-blank, full-viewport background so the page is a clearly non-black frame
+       (SwiftShader-safe: no GPU/WebGL needed), mirroring smoke.html's non-blank guarantee. */
+    body { background: #103a5c; color: #ffffff; }
+
+    /* The fake consent / CMP modal the recipe dismisses (INJ-05) and re-dismisses on re-mount (INJ-03). */
+    #consent-modal {
+      position: fixed; inset: 0; z-index: 9999;
+      background: rgba(0,0,0,0.85);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 5vh;
+    }
+
+    /* Nav chrome + ad blocks the recipe hides (INJ-05). */
+    #nav-chrome { height: 12vh; background: #222; display: flex; align-items: center; padding: 0 2vw; }
+    .ad-block { height: 10vh; background: #553; margin: 1vh 2vw; display: flex; align-items: center; padding: 0 2vw; }
+
+    /* The target widget with a measurable bounding box the recipe isolates + fills (INJ-05). */
+    #target-widget {
+      position: fixed; left: 10vw; top: 30vh; width: 60vw; height: 40vh;
+      background: #1ec873; display: flex; align-items: center; justify-content: center;
+      font-size: 6vh;
+    }
+  </style>
+</head>
+<body>
+  <!-- Consent / CMP modal — the recipe dismisses this by selector and sets window.consentDismissed.
+       The fixture itself can RE-MOUNT it (see the re-mount trigger below) to test the INJ-03
+       MutationObserver re-assert. -->
+  <div id="consent-modal">CONSENT — Accept cookies?</div>
+
+  <!-- Nav chrome the recipe hides (sets window.chromeHidden). -->
+  <div id="nav-chrome">SITE NAV CHROME</div>
+
+  <!-- Ad blocks the recipe hides. -->
+  <div class="ad-block">ADVERTISEMENT 1</div>
+  <div class="ad-block">ADVERTISEMENT 2</div>
+
+  <!-- The target widget the recipe isolates + fills (sets window.targetFilled). -->
+  <div id="target-widget">TARGET WIDGET</div>
+
+  <!-- A <video> the recipe starts via video.play() (sets window.playStarted) — NO coordinate click;
+       the recipe drives it by SELECTOR. muted + a tiny data-URI source so play() resolves headless. -->
+  <video id="player" muted playsinline
+         src="data:video/mp4;base64,AAAAFGZ0eXBtcDQyAAAAAG1wNDI=">
+  </video>
+
+  <!-- D-22 CROSS-ORIGIN IFRAME. The src is rewritten at serve time by RunInjectSmoke to point at the
+       iframe document on a GENUINELY DIFFERENT ORIGIN (a different listener port), so under the
+       site-isolation-OFF flags it becomes an OOPIF and actually exercises INJ-04. The doc-start
+       harness reaches INTO this frame and the recipe sets window.__xpnIframeTargetHit IN THE IFRAME'S
+       OWN context — the main page neither can nor does read it. The literal token __IFRAME_ORIGIN__
+       is replaced by the listener with the iframe's absolute origin URL. -->
+  <iframe id="xo-frame" title="cross-origin target"
+          style="position:fixed; right:2vw; bottom:2vh; width:25vw; height:20vh; border:0;"
+          src="__IFRAME_ORIGIN__/iframe"></iframe>
+
+  <script>
+    // RE-MOUNT TRIGGER (INJ-03). The fixture re-inserts the consent modal a moment after load so
+    // RunInjectSmoke can prove the recipe's MutationObserver re-dismisses it (not just a one-shot).
+    // RunInjectSmoke triggers this by setting window.__xpnRemountNow = true (polled here), so the
+    // self-check controls the timing deterministically rather than racing a fixed timer.
+    (function () {
+      function remountConsent() {
+        if (document.getElementById('consent-modal')) { return; }
+        var m = document.createElement('div');
+        m.id = 'consent-modal';
+        m.textContent = 'CONSENT — Accept cookies? (re-mounted)';
+        m.style.cssText =
+          'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.85);' +
+          'display:flex;align-items:center;justify-content:center;font-size:5vh;';
+        document.body.appendChild(m);
+        window.consentRemounted = true;
+        // The recipe's MutationObserver should observe this re-insertion and re-dismiss it,
+        // re-setting window.consentDismissed = true.
+        window.consentDismissed = false;
+      }
+
+      var poll = setInterval(function () {
+        if (window.__xpnRemountNow === true) {
+          window.__xpnRemountNow = false;
+          remountConsent();
+        }
+      }, 25);
+      // Stop polling eventually so the fixture cannot spin forever in a long-lived run.
+      setTimeout(function () { clearInterval(poll); }, 30000);
+    })();
+  </script>
+</body>
+</html>
