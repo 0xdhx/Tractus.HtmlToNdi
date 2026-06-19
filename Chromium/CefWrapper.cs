@@ -1,11 +1,10 @@
 
 using CefSharp;
 using CefSharp.OffScreen;
-using NewTek;
 
 namespace Tractus.HtmlToNdi.Chromium;
 
-public class CefWrapper : IDisposable
+public class CefWrapper : IDisposable, IFrameSource
 {
     private bool disposedValue;
     private ChromiumWebBrowser? browser;
@@ -17,6 +16,19 @@ public class CefWrapper : IDisposable
 
     private Thread RenderWatchdog;
     private DateTime lastPaint = DateTime.MinValue;
+
+    /// <summary>
+    /// IFrameSource liveness clock (D-25) — surfaces the existing <see cref="lastPaint"/> stamp.
+    /// </summary>
+    public DateTime LastPaint => this.lastPaint;
+
+    /// <summary>
+    /// IFrameSource frame-ready event (D-01/D-25). RAISED from <see cref="OnBrowserPaint"/> for each
+    /// paint; <see cref="NdiFrameSink"/> (and the future Phase-2 monitor) SUBSCRIBE. The
+    /// <see cref="FrameView.Buffer"/> pointer is CALLBACK-SCOPED — subscribers must send/inspect
+    /// in-call and copy if they retain it (Pitfall 3). See <see cref="IFrameSource.FrameReady"/>.
+    /// </summary>
+    public event Action<FrameView>? FrameReady;
 
     // D-15b: conditional one-shot smoke seam. OnBrowserPaint is private and the upstream send
     // is continuous (gated only on Program.NdiSenderPtr != Zero), so "exactly one send" cannot
@@ -113,21 +125,10 @@ public class CefWrapper : IDisposable
             }
         }
 
-        var videoFrame = new NDIlib.video_frame_v2_t()
-        {
-            FourCC = NDIlib.FourCC_type_e.FourCC_type_BGRA,
-            frame_rate_N = 60,
-            frame_rate_D = 1,
-            frame_format_type = NDIlib.frame_format_type_e.frame_format_type_progressive,
-            line_stride_in_bytes = e.Width * 4,
-            picture_aspect_ratio = (float)e.Width / e.Height,
-            p_data = e.BufferHandle,
-            timecode = NDIlib.send_timecode_synthesize,
-            xres = e.Width,
-            yres = e.Height,
-        };
-
-        NDIlib.send_send_video_v2(Program.NdiSenderPtr, ref videoFrame);
+        // D-01/D-25: this wrapper is the SOURCE — it RAISES the frame-ready event with a primitive,
+        // callback-scoped view. The subscribed NdiFrameSink does the actual NDIlib send (the send was
+        // extracted out of this hot path). The buffer pointer is valid only for this invocation.
+        this.FrameReady?.Invoke(new FrameView(e.BufferHandle, e.Width, e.Height, e.Width * 4));
 
         if (this.SmokeMode && !this.smokeSent)
         {

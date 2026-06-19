@@ -185,6 +185,13 @@ public class Program
 
         Program.NdiSenderPtr = NDIlib.send_create(ref settings_T);
 
+        // D-01/D-26: construct the extracted NDI sink with the ctor-injected sender ptr and subscribe
+        // it to the CefWrapper IFrameSource. OnBrowserPaint early-returns while NdiSenderPtr == Zero,
+        // and the watchdog re-invalidates paint every second, so subscribing here (right after the
+        // sender exists) catches every subsequent frame — identical timing to the upstream send.
+        var ndiSink = new NdiFrameSink(Program.NdiSenderPtr);
+        ndiSink.AttachTo(browserWrapper);
+
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
         var capabilitiesPtr = UTF.StringToUtf8(capabilitiesXml);
@@ -371,9 +378,10 @@ public class Program
                     SmokeMode = true, // D-15b: arm the one-shot latch.
                 };
 
-                await browserWrapper.InitializeWrapperAsync();
-
                 // Behavior 2: create the NDI sender; nint.Zero ⇒ wrong/missing NDI DLL ⇒ fail.
+                // Created BEFORE InitializeWrapperAsync so the sink can be constructed with a valid
+                // sender ptr (D-26) and subscribed BEFORE Paint is wired — so the first paint reaches
+                // the sink (no lost-first-frame race with the smoke latch).
                 var settings_T = new NDIlib.send_create_t
                 {
                     p_ndi_name = UTF.StringToUtf8(ndiName)
@@ -385,6 +393,13 @@ public class Program
                     Log.Error("SMOKE FAILED — NDIlib.send_create returned nint.Zero (NDI native DLL missing or wrong).");
                     return; // exitCode stays 1
                 }
+
+                // D-01/D-26: construct the extracted NDI sink with the ctor-injected sender ptr and
+                // subscribe it to the CefWrapper IFrameSource BEFORE InitializeWrapperAsync wires Paint.
+                var ndiSink = new NdiFrameSink(Program.NdiSenderPtr);
+                ndiSink.AttachTo(browserWrapper);
+
+                await browserWrapper.InitializeWrapperAsync();
 
                 // Behaviors 1/3: wait for EXACTLY ONE non-blank frame, bounded by the hard timeout.
                 var sentTask = browserWrapper.SmokeFrameSent;
