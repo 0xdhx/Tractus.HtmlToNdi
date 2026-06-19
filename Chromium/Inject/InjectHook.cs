@@ -281,8 +281,15 @@ public sealed class InjectHook : IDisposable
 
             function __xpnArmObserver() {
                 try {
-                    var target = document.documentElement;
-                    if (!target) { return; }
+                    // At document-start the document is EMPTY — document.documentElement is still null
+                    // (the <html> element has not been parsed yet). Arming on the null documentElement
+                    // (the prior `if (!target) return`) left the observer UN-armed, so apply() ran exactly
+                    // once on the empty document and NEVER re-fired — every element-gated recipe action
+                    // (target isolate/fill, play(), and the INJ-03 consent re-dismiss) silently no-op'd.
+                    // Observe `document` (always present at document-start) with subtree:true so the observer
+                    // catches the later-parsed <html>/<body> and re-runs apply() once those actions are
+                    // possible. (Caught by the D-14 --inject-smoke fixture: INJ-05 targetFilled/playStarted.)
+                    var target = document.documentElement || document;
                     var obs = new MutationObserver(__xpnSchedule);
                     obs.observe(target, { childList: true, subtree: true });
                 } catch (e) {}
