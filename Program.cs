@@ -726,8 +726,23 @@ public class Program
             var store = new RecipeStore(validator);
             store.Load(recipeDir);
 
-            // Recipe A matches the localhost host (D-05). Recipe B is the distinct-guard swap target.
-            Recipe? recipeA = store.Match(fixtureUrl);
+            // Recipe A is the acceptance recipe; recipe B is the distinct-guard swap target. Both are
+            // resolved EXPLICITLY by filename (NOT store.Match): both recipes share urlMatch "localhost",
+            // and Match is first-match-wins over an Ordinal filename sort, so "inject-fixture-b..." ('-'
+            // = 0x2D sorts before '.' = 0x2E) would bind recipeA to recipe B. That made recipe A never
+            // run, so the D-24 A->B swap degenerated to B->B and "A's guard is gone" passed trivially —
+            // masking whether stale-script removal actually works. Explicit load makes recipe A run.
+            Recipe? recipeA = null;
+            if (!store.TryLoadExplicit(Path.Combine(recipeDir, "inject-fixture.localhost.json"), out recipeA, out var aErr))
+            {
+                Console.WriteLine($"INJECT-SMOKE FAIL: recipe A failed to load: {aErr}");
+                Log.Error("INJECT-SMOKE FAIL — recipe A load: {Err}", aErr);
+                listenerCts.Cancel();
+                try { listener.Stop(); } catch { }
+                Log.CloseAndFlush();
+                Environment.Exit(1);
+            }
+
             Recipe? recipeB = null;
             if (!store.TryLoadExplicit(Path.Combine(recipeDir, "inject-fixture-b.localhost.json"), out recipeB, out var bErr))
             {
@@ -739,10 +754,12 @@ public class Program
                 Environment.Exit(1);
             }
 
+            // Unreachable after the fail-loud explicit load above (TryLoadExplicit returns true ⟹
+            // non-null); kept as the compiler null-guard for the recipeA dereference below (CS8602).
             if (recipeA is null)
             {
-                Console.WriteLine("INJECT-SMOKE FAIL: recipe A did not match the localhost fixture URL");
-                Log.Error("INJECT-SMOKE FAIL — recipe A no match for {Url}", fixtureUrl);
+                Console.WriteLine("INJECT-SMOKE FAIL: recipe A unexpectedly null after explicit load");
+                Log.Error("INJECT-SMOKE FAIL — recipe A null after load of {Url}", fixtureUrl);
                 listenerCts.Cancel();
                 try { listener.Stop(); } catch { }
                 Log.CloseAndFlush();
