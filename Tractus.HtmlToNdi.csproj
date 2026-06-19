@@ -84,4 +84,16 @@
     </None>
   </ItemGroup>
 
+  <!-- D-14/D-22: the inject-smoke self-check serves these committed fixtures over a loopback HTTP
+       listener (NOT file://). Both docs must ship beside the exe; the listener reads them at startup
+       and serves the main fixture + the cross-origin iframe target on two different loopback origins. -->
+  <ItemGroup>
+    <None Update="tests-fixtures\inject-fixture.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="tests-fixtures\inject-iframe.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
