@@ -12,6 +12,7 @@ using Serilog;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Tractus.HtmlToNdi.Chromium;
+using Tractus.HtmlToNdi.Chromium.Inject;
 using Tractus.HtmlToNdi.Models;
 
 namespace Tractus.HtmlToNdi;
@@ -19,6 +20,14 @@ public class Program
 {
     public static nint NdiSenderPtr;
     public static CefWrapper browserWrapper;
+
+    // D-06/D-21: the recipe store + the launch posture captured at startup. The store backs both the
+    // /recipe GET/POST endpoints and the /seturl recipe re-match; the launch posture (the
+    // ExpectsCrossOriginIframes value that gated the FROZEN site-isolation flags at Cef.Initialize) is
+    // the reference the /recipe + /seturl swaps reject a mismatch against (D-21 — site-iso cannot change
+    // at runtime).
+    public static RecipeStore recipeStore;
+    public static bool launchExpectsCrossOriginIframes;
 
     public static void Main(string[] args)
     {
@@ -132,6 +141,78 @@ public class Program
             }
         }
 
+        // D-06/D-09: --recipe-dir <dir> defaults to the bundle-relative recipes/ path (the publish step
+        // copies the parent recipes/ into the bundle). --recipe <name> is an EXPLICIT recipe file (D-20:
+        // an explicit recipe that fails validation MUST fail startup loud).
+        var recipeDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "recipes");
+        if (args.Any(x => x.StartsWith("--recipe-dir")))
+        {
+            try
+            {
+                recipeDir = args.FirstOrDefault(x => x.StartsWith("--recipe-dir")).Split("=")[1];
+                if (string.IsNullOrWhiteSpace(recipeDir))
+                {
+                    throw new ArgumentException();
+                }
+            }
+            catch (Exception)
+            {
+                Log.Error("Could not parse the --recipe-dir parameter. Exiting.");
+                return;
+            }
+        }
+
+        string? explicitRecipeName = null;
+        // Match --recipe but NOT --recipe-dir (StartsWith would alias them).
+        if (args.Any(x => x.StartsWith("--recipe") && !x.StartsWith("--recipe-dir")))
+        {
+            try
+            {
+                explicitRecipeName = args.First(x => x.StartsWith("--recipe") && !x.StartsWith("--recipe-dir")).Split("=")[1];
+                if (string.IsNullOrWhiteSpace(explicitRecipeName))
+                {
+                    throw new ArgumentException();
+                }
+            }
+            catch (Exception)
+            {
+                Log.Error("Could not parse the --recipe parameter. Exiting.");
+                return;
+            }
+        }
+
+        // ── Two-phase recipe resolution, PHASE 1 (D-16 / Pitfall 4): load + match SYNCHRONOUSLY BEFORE
+        // Cef.Initialize, because the matched recipe's ExpectsCrossOriginIframes gates the site-isolation
+        // CefCommandLineArgs — flags added AFTER Cef.Initialize are silently ignored. Phase 2 (register
+        // the doc-start script) happens inside CefWrapper.InitializeWrapperAsync, before the first Load.
+        recipeStore = new RecipeStore(new RecipeValidator());
+        recipeStore.Load(recipeDir);
+
+        Recipe? startupRecipe = null;
+        if (explicitRecipeName is not null)
+        {
+            // D-20 (mode 2): an EXPLICIT --recipe that fails parse/validate is a HARD startup failure.
+            var explicitPath = Path.IsPathRooted(explicitRecipeName)
+                ? explicitRecipeName
+                : Path.Combine(recipeDir, explicitRecipeName.EndsWith(".json") ? explicitRecipeName : explicitRecipeName + ".json");
+
+            if (!recipeStore.TryLoadExplicit(explicitPath, out startupRecipe, out var explicitError))
+            {
+                Log.Error("Explicit --recipe failed to load: {Error}. Exiting.", explicitError);
+                return; // fail startup LOUD (D-20).
+            }
+        }
+        else
+        {
+            // No explicit recipe → match the start URL against the loaded dir (D-07: a miss is a
+            // pass-through with the store's "no recipe for <host>" warning — NOT a crash).
+            startupRecipe = recipeStore.Match(startUrl);
+        }
+
+        // D-21: capture the launch posture (the value that gates the FROZEN site-iso flags) so runtime
+        // swaps can reject a posture mismatch.
+        launchExpectsCrossOriginIframes = startupRecipe?.ExpectsCrossOriginIframes ?? false;
+
         AsyncContext.Run(async delegate
         {
             var settings = new CefSettings();
@@ -148,18 +229,48 @@ public class Program
             settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
             //settings.CefCommandLineArgs.Add("off-screen-frame-rate", "60");
             //settings.CefCommandLineArgs.Add("disable-frame-rate-limit");
+
+            // D-13: anti-throttle flags — set UNCONDITIONALLY before Cef.Initialize (also on the smoke
+            // path) so a backgrounded/occluded offscreen surface does not throttle timers / rAF
+            // (primarily serves Phase-2 freeze detection; cheap to set now).
+            settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+            settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+            settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+            // D-03: site-isolation-disabling flags — RECIPE-GATED, default OFF. Added BEFORE
+            // Cef.Initialize (Pitfall 4: late adds are silently ignored) only when the startup recipe
+            // declares expectsCrossOriginIframes, so injected scripts + the .NET<->JS bridge can reach a
+            // cross-origin iframe. These flags are process-global + FROZEN for the run (D-21).
+            if (startupRecipe?.ExpectsCrossOriginIframes == true)
+            {
+                settings.CefCommandLineArgs.Add("disable-features", "IsolateOrigins,site-per-process");
+                settings.CefCommandLineArgs.Add("disable-site-isolation-trials", "1");
+            }
+
             settings.EnableAudio();
             Cef.Initialize(settings);
             browserWrapper = new CefWrapper(
                 width,
                 height,
-                startUrl);
+                startUrl)
+            {
+                StartupRecipe = startupRecipe, // D-16: registered in InitializeWrapperAsync BEFORE Load.
+            };
 
             await browserWrapper.InitializeWrapperAsync();
         });
 
         // D-13: provenance stamp on normal startup (CEF is initialized so CefSharpVersion is valid).
         AppManagement.LogProvenance();
+
+        // D-03 posture log: state site-isolation ON/OFF + the cause (the recipe urlMatch that gated the
+        // flags, or "(no recipe)"). Field shape (isolation + cause) is designed so a Phase-2 /health can
+        // surface it without rework. site-isolation is ON when the flags were NOT added (default), OFF
+        // when the recipe gated them off.
+        Log.Information(
+            "POSTURE site-isolation={Iso} cause={Cause}",
+            launchExpectsCrossOriginIframes ? "OFF" : "ON",
+            startupRecipe?.UrlMatch ?? "(no recipe)");
 
         var builder = WebApplication.CreateBuilder(args);
 
@@ -266,10 +377,73 @@ public class Program
         thread.Start();
 
 
-        app.MapPost("/seturl", (HttpContext httpContext, GoToUrlModel url) =>
+        app.MapPost("/seturl", async (HttpContext httpContext, GoToUrlModel url) =>
         {
-            browserWrapper.SetUrl(url.Url);
-            return true;
+            // D-16: await SetUrlAsync (the synchronous void SetUrl is gone). Resolve the recipe for the
+            // new URL via the store so a navigation that crosses into a recipe-governed host re-registers
+            // the doc-start script BEFORE Load. D-21: reject a swap whose isolation posture differs from
+            // launch (site-iso is frozen at Cef.Initialize) — fail loud, do not silently mis-render.
+            var nextRecipe = recipeStore.Match(url.Url);
+            if (nextRecipe is not null
+                && !RecipeStore.PostureMatches(launchExpectsCrossOriginIframes, nextRecipe))
+            {
+                return Results.BadRequest(new
+                {
+                    error = "posture-mismatch",
+                    message = "The recipe matching this URL requires a different site-isolation posture than launch. "
+                        + "Site-isolation flags are frozen at process start; relaunch with this recipe to apply it.",
+                    launchExpectsCrossOriginIframes,
+                    requiredExpectsCrossOriginIframes = nextRecipe.ExpectsCrossOriginIframes,
+                });
+            }
+
+            await browserWrapper.SetUrlAsync(url.Url, nextRecipe);
+            return Results.Ok();
+        })
+        .WithOpenApi();
+
+        // D-06: /recipe GET returns the current recipe driving injection (null = pass-through).
+        app.MapGet("/recipe", () => browserWrapper.CurrentRecipe)
+            .WithOpenApi();
+
+        // D-06/D-12/D-18/D-21/D-04: /recipe POST reads the RAW body (NOT a direct RecipeDto bind, which
+        // would silently drop unknown fields — D-18), validates via the shared raw-JSON validator,
+        // rejects a posture mismatch (D-21), then swaps fail-closed (D-04). Never partial-applies (D-12).
+        app.MapPost("/recipe", async (HttpContext ctx) =>
+        {
+            string rawJson;
+            using (var reader = new StreamReader(ctx.Request.Body))
+            {
+                rawJson = await reader.ReadToEndAsync();
+            }
+
+            // recipeStore is guaranteed non-null here (set in Main before the host runs). Use the shared
+            // raw-JSON validator (the SAME path the store uses on file-load) so the two surfaces cannot drift.
+            var (ok, recipe, errors) = new RecipeValidator().TryNormalize(rawJson);
+
+            if (!ok || recipe is null)
+            {
+                // D-12/D-18: structured errors, never a partial apply.
+                return Results.BadRequest(new { error = "invalid-recipe", errors });
+            }
+
+            // D-21: a swap whose required posture differs from the FROZEN launch posture is rejected with
+            // a structured relaunch error — the current recipe is left unchanged.
+            if (!RecipeStore.PostureMatches(launchExpectsCrossOriginIframes, recipe))
+            {
+                return Results.BadRequest(new
+                {
+                    error = "posture-mismatch",
+                    message = "This recipe requires a different site-isolation posture than launch. "
+                        + "Site-isolation flags are frozen at process start; relaunch with this recipe to apply it.",
+                    launchExpectsCrossOriginIframes,
+                    requiredExpectsCrossOriginIframes = recipe.ExpectsCrossOriginIframes,
+                });
+            }
+
+            // D-04/D-17: fail-closed swap (remove-by-id → re-add; RecreateBrowserAsync on a Remove failure).
+            await browserWrapper.SwapRecipeAsync(recipe);
+            return Results.Ok();
         })
         .WithOpenApi();
 
@@ -367,6 +541,12 @@ public class Program
 
                 settings.RootCachePath = launchCachePath;
                 settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+
+                // D-13: anti-throttle flags — kept IN SYNC with the normal path (unconditional).
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
                 settings.EnableAudio();
                 Cef.Initialize(settings);
 
