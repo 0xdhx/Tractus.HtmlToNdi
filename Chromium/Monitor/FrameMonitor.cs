@@ -245,6 +245,28 @@ public sealed class FrameMonitor : IDisposable
     private int hashRingCount;
     private int hashRingNext;
 
+    // ── 03-03 (D-13/D-24) LIVENESS-BEACON sampling state (monitor-owned, pixel-sampled) ──
+    // The injected beacon (InjectHook) draws an OPAQUE-RGB bar mutating each rAF tick over an alpha-0
+    // corner. Classify samples the beacon-region RGB off the SAME copied straight `snapshot` each tick and
+    // compares to the prior tick to derive `beaconChanged`. beacon-frozen (unchanged while expectMotion) is
+    // returned as a Classify-bad reason that feeds the EXISTING hysteresisKIn run-counter (D-25) — NOT a
+    // 1-sample bypass, NOT a separate per-beacon counter. "Cut immediately" (D-13) means it bypasses the
+    // freezeTimeoutMs BACKSTOP wait, not the K-in samples. An ABSENT beacon (never injected/armed) MUST
+    // degrade to the dHash + paint-age backstop and NEVER false-trip on absence (D-13).
+    private long beaconPrevRgbSum = -1;     // prior tick's summed beacon RGB (-1 = no prior sample yet).
+    private bool beaconPrevPresent;          // whether the prior tick saw a present (non-absent) beacon.
+    private BeaconLiveness beaconState = BeaconLiveness.Absent; // the 3-state surfaced on /health.
+
+    // ── 03-03 (D-24) read-only SampleObserved telemetry-out seam ──
+    // Plan 04's D-07 capture + the BeaconClassify tests observe the monitor's per-sample internal decision
+    // values (dHash / hamming-from-prev / beacon-state) WITHOUT widening the private Classify visibility.
+    // READ-ONLY: raising it never mutates monitor/render state. FrameMonitor stays IFrameSource-only — this
+    // seam exposes pixel-derived values, never any page JS flag (D-24).
+    private ulong lastSampleDHash;
+    private int lastSampleHammingFromPrev;
+    private ulong sampleObservedPrevDHash;
+    private bool sampleObservedHasPrevDHash;
+
     // Transition log (Pitfall P-4 — every state change is recorded with its triggering reason).
     private readonly List<string> transitionLog = new();
 
@@ -323,6 +345,34 @@ public sealed class FrameMonitor : IDisposable
 
     /// <summary>Snapshot of the transition log (Pitfall P-4 — every change recorded with its reason).</summary>
     public IReadOnlyList<string> TransitionLog { get { lock (this.stateLock) { return this.transitionLog.ToArray(); } } }
+
+    // ── 03-03 (D-24) read-only SampleObserved telemetry-out seam ──
+
+    /// <summary>
+    /// D-24: an immutable, READ-ONLY per-sample telemetry record exposing the monitor's internal Classify
+    /// decision values — the whole-frame dHash, the Hamming distance from the prior sample's dHash, and the
+    /// pixel-sampled 3-state beacon liveness. Plan 04's D-07 capture + the BeaconClassify tests observe these
+    /// WITHOUT widening the private <see cref="Classify"/> visibility. Carries NO page JS flag (FrameMonitor
+    /// stays IFrameSource-only, D-24).
+    /// </summary>
+    public readonly record struct SampleSnapshot(
+        DateTime Ts,
+        bool IsBad,
+        string Reason,
+        ulong DHash,
+        int HammingFromPrev,
+        BeaconLiveness BeaconState);
+
+    /// <summary>
+    /// D-24: raised once per sample tick AFTER Classify, with the read-only <see cref="SampleSnapshot"/>. The
+    /// handler must not mutate monitor/render state (the seam is observability only). Used by plan 04's D-07
+    /// capture and exercised by the BeaconClassify tests to assert the K-in path without widening visibility.
+    /// </summary>
+    public event Action<SampleSnapshot>? SampleObserved;
+
+    /// <summary>D-24: the most recent <see cref="SampleSnapshot"/> (a pull alternative to the event).</summary>
+    public SampleSnapshot? LastSampleSnapshot { get { lock (this.stateLock) { return this.lastSampleSnapshot; } } }
+    private SampleSnapshot? lastSampleSnapshot;
 
     // ── D-23/D-27 /health context: the CROSS-COMPONENT fields the snapshot reports that the monitor does
     // NOT own (the pump's FramesSent, the process start, the current recipe urlMatch summary, the P1
@@ -429,6 +479,13 @@ public sealed class FrameMonitor : IDisposable
                     Ts = this.lastTransitionTs,
                     Reason = this.lastTransitionReason,
                 },
+
+                // 03-03 (D-13): the MONITOR-OWNED, pixel-sampled 3-state beacon liveness. Surfaced only when
+                // motion is expected (the beacon is only injected on expectMotion recipes, D-15); null otherwise
+                // so a static-page /health omits the field. The targetPresent/consentDismissed/playStarted proof
+                // markers are NOT monitor-owned — left null here and COMPOSED at /health by the sibling CDP probe
+                // (Program.cs Part D, D-24); FrameMonitor never reads page JS.
+                BeaconAlive = this.expectMotion ? this.beaconState : (BeaconLiveness?)null,
             };
         }
     }
@@ -501,6 +558,7 @@ public sealed class FrameMonitor : IDisposable
     {
         var (isBad, reason) = this.Classify(now);
 
+        SampleSnapshot snap;
         lock (this.stateLock)
         {
             if (isBad)
@@ -511,7 +569,18 @@ public sealed class FrameMonitor : IDisposable
             {
                 this.OnGoodSample(now);
             }
+
+            // D-24: build the read-only telemetry snapshot from the values Classify just stamped (under the
+            // lock so the per-sample fields are observed consistently). The dHash/hamming are 0 on the
+            // expectMotion=false / no-snapshot paths (the freeze branch is disabled there).
+            snap = new SampleSnapshot(
+                now, isBad, reason, this.lastSampleDHash, this.lastSampleHammingFromPrev, this.beaconState);
+            this.lastSampleSnapshot = snap;
         }
+
+        // Raise OUTSIDE the lock (a handler must never re-enter the monitor under the state lock). The seam
+        // is read-only: nothing the handler does flows back into classification (D-24).
+        this.SampleObserved?.Invoke(snap);
     }
 
     /// <summary>
@@ -539,6 +608,31 @@ public sealed class FrameMonitor : IDisposable
             blank = BlankDetector.Analyze(snapshot, w, h, stride);
         }
 
+        // 03-03 (D-24 telemetry seam): compute the whole-frame dHash + Hamming-from-prev for EVERY sample
+        // that has a snapshot (independent of expectMotion) so the SampleObserved seam always carries the
+        // real dHash/hamming. This is read-only telemetry; the freeze BACKSTOP still only ACTS under
+        // expectMotion below. dHash/hamming default to 0 when there is no snapshot.
+        if (snapshot is not null)
+        {
+            var seamHash = DiffHash.Compute(snapshot, w, h, stride);
+            this.lastSampleDHash = seamHash;
+            this.lastSampleHammingFromPrev = this.sampleObservedHasPrevDHash
+                ? DiffHash.Hamming(seamHash, this.sampleObservedPrevDHash)
+                : 0;
+            this.sampleObservedPrevDHash = seamHash;
+            this.sampleObservedHasPrevDHash = true;
+        }
+        else
+        {
+            this.lastSampleDHash = 0;
+            this.lastSampleHammingFromPrev = 0;
+        }
+
+        // 03-03 (D-13): sample the BEACON-REGION pre-key RGB off the SAME copied straight snapshot and derive
+        // the 3-state liveness (ticking / frozen / absent) BEFORE the dHash backstop. Monitor-owned, pixel-
+        // sampled — NO page JS read (D-24, IFrameSource-only).
+        this.UpdateBeaconState(snapshot, w, h, stride);
+
         if (cadenceStalled && this.expectMotion)
         {
             return (true, "cadence-stall");
@@ -555,11 +649,24 @@ public sealed class FrameMonitor : IDisposable
             return (true, blank.Reason == BlankReason.AllAlphaZero ? "blank-alpha0" : "blank-lowvariance");
         }
 
-        // (2) FREEZE — content-delta freeze, GATED by expectMotion (D-11: a static page must never trip).
+        // 03-03 (D-13/D-25) BEACON-FROZEN — checked BEFORE the dHash backstop. A FROZEN beacon (RGB unchanged
+        // across consecutive samples) while motion is expected is the GENUINE-freeze signal. It returns a
+        // bad reason that feeds the EXISTING hysteresisKIn run-counter (via OnBadSample) exactly like the
+        // cadence/blank reasons — NOT a 1-sample bypass, NOT a separate per-beacon counter (D-25). "Cut
+        // immediately" (D-13) means it skips only the freezeTimeoutMs BACKSTOP wait: at 5Hz with Kin~3 the
+        // flip is sub-second (D-08). An ABSENT beacon (never injected/armed) is NOT a trip — it degrades to
+        // the dHash + paint-age backstop below (D-13: "beacon absent" NEVER trips a false freeze).
+        if (this.expectMotion && this.beaconState == BeaconLiveness.False)
+        {
+            return (true, "beacon-frozen");
+        }
+
+        // (2) FREEZE — content-delta freeze BACKSTOP, GATED by expectMotion (D-11: a static page must never
+        // trip). Retained as the backstop behind the beacon (and the ONLY freeze trip when the beacon is
+        // absent). Reuses the dHash already computed above for the seam — push it into the freeze ring here.
         if (snapshot is not null && this.expectMotion)
         {
-            var hash = DiffHash.Compute(snapshot, w, h, stride);
-            this.PushHash(hash);
+            this.PushHash(this.lastSampleDHash);
             if (this.HashWindowFrozen())
             {
                 return (true, "freeze-dhash");
@@ -572,6 +679,95 @@ public sealed class FrameMonitor : IDisposable
         }
 
         return (false, string.Empty);
+    }
+
+    /// <summary>
+    /// 03-03 (D-13): derive the 3-state beacon liveness from the beacon-region pre-key RGB in the copied
+    /// straight snapshot. Sums the OPAQUE-RGB energy over the sampled beacon pixels; compares to the prior
+    /// tick to decide ticking vs frozen; classifies ABSENT when no beacon RGB energy is present (never
+    /// injected/armed). Monitor-owned, pixel-sampled — reads NO page JS (D-24). Mutated on the sample thread.
+    /// </summary>
+    private void UpdateBeaconState(byte[]? snapshot, int w, int h, int stride)
+    {
+        if (snapshot is null)
+        {
+            // No live paint yet — leave the beacon state ABSENT (the backstop governs; no false trip).
+            this.beaconState = BeaconLiveness.Absent;
+            this.beaconPrevRgbSum = -1;
+            this.beaconPrevPresent = false;
+            return;
+        }
+
+        var (rgbSum, present) = SampleBeaconRgb(snapshot, w, h, stride);
+
+        if (!present)
+        {
+            // ABSENT: no beacon RGB energy (never injected, or culled). NEVER a trip — backstop governs (D-13).
+            this.beaconState = BeaconLiveness.Absent;
+            this.beaconPrevRgbSum = -1;
+            this.beaconPrevPresent = false;
+            return;
+        }
+
+        if (!this.beaconPrevPresent || this.beaconPrevRgbSum < 0)
+        {
+            // First present sample after absence/startup — establish a baseline, treat as ticking (alive).
+            this.beaconState = BeaconLiveness.True;
+        }
+        else
+        {
+            var delta = Math.Abs(rgbSum - this.beaconPrevRgbSum);
+            this.beaconState = delta >= MonitorDefaults.BeaconChangeBound
+                ? BeaconLiveness.True   // RGB changed since the prior sample → ticking/alive.
+                : BeaconLiveness.False; // RGB unchanged while present + motion expected → FROZEN (D-13/D-25).
+        }
+
+        this.beaconPrevRgbSum = rgbSum;
+        this.beaconPrevPresent = true;
+    }
+
+    /// <summary>
+    /// 03-03 (D-13): sample the injected beacon region (a small grid spanning the canvas corner) off the
+    /// copied straight BGRA buffer and return (summed RGB energy, present). "present" = the summed RGB
+    /// energy is at/above <see cref="MonitorDefaults.BeaconPresenceFloor"/> (a real beacon draws an opaque
+    /// bar; an absent/culled beacon leaves the corner at 0 RGB). Bounds-checked against the buffer geometry.
+    /// </summary>
+    private static (long RgbSum, bool Present) SampleBeaconRgb(byte[] snapshot, int w, int h, int stride)
+    {
+        if (w <= 0 || h <= 0 || stride < w * 4)
+        {
+            return (0, false);
+        }
+
+        // Sample a 4x4 grid of points across the beacon canvas extent (clamped to the buffer). Summing
+        // several points (not a single pixel) makes the change/presence signal robust to the moving bar's
+        // sub-pixel placement and to AA at the bar edge.
+        const int Grid = 4;
+        var size = MonitorDefaults.BeaconSizePx;
+        long sum = 0;
+        for (var gy = 0; gy < Grid; gy++)
+        {
+            for (var gx = 0; gx < Grid; gx++)
+            {
+                var px = MonitorDefaults.BeaconOriginX + (gx * size) / Grid;
+                var py = MonitorDefaults.BeaconOriginY + (gy * size) / Grid;
+                if (px >= w || py >= h)
+                {
+                    continue;
+                }
+
+                var off = (long)py * stride + (long)px * 4;
+                if (off < 0 || off + 2 >= snapshot.Length)
+                {
+                    continue;
+                }
+
+                // BGRA: sum B+G+R (the opaque RGB the beacon draws; alpha is keyed out on air, ignored here).
+                sum += snapshot[off + 0] + snapshot[off + 1] + snapshot[off + 2];
+            }
+        }
+
+        return (sum, sum >= MonitorDefaults.BeaconPresenceFloor);
     }
 
     // Push a hash into the freeze ring (D-07).
@@ -839,6 +1035,17 @@ public sealed class FrameMonitor : IDisposable
             this.fallbackReason = string.Empty;
             Volatile.Write(ref this.refreshInFlight, false);
             this.UseFallback(false); // back to Live — the new page is presumed good until proven bad.
+
+            // 03-03 (D-13/D-24/D-26): clear the beacon + seam baselines so the swapped page's beacon is
+            // re-baselined fresh (the prior page's beacon RGB must not be compared against the new page's).
+            this.beaconPrevRgbSum = -1;
+            this.beaconPrevPresent = false;
+            this.beaconState = BeaconLiveness.Absent;
+            this.sampleObservedHasPrevDHash = false;
+            this.sampleObservedPrevDHash = 0;
+            this.lastSampleDHash = 0;
+            this.lastSampleHammingFromPrev = 0;
+            this.lastSampleSnapshot = null;
 
             // Apply the new recipe's timing/expectMotion INSIDE the same lock as the state clear so a
             // concurrent sample tick can never observe a half-reset (new windows, old expectMotion).

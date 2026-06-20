@@ -628,8 +628,32 @@ public class Program
         // distinguishes the two without a re-instrumentation pass — and never needlessly restarts a
         // recovering process. D-32: status/source serialize as STRING tokens (recovery-exhausted/fallback),
         // never integers (the KebabCaseStringEnumConverter on the enums), so the watchdog reads the contract.
-        app.MapGet("/health", () => monitor.SnapshotHealth())
-            .WithOpenApi();
+        // 03-03 (D-24/D-06/D-03): the /health endpoint COMPOSES the three JS proof markers via a SIBLING CDP
+        // Runtime.evaluate probe — reusing the existing EvaluateScriptAsync machinery (ReadMainBoolAsync,
+        // the PollMainFlagAsync shape; NO new CDP code) — reading window.__xpnTargetPresent /
+        // __xpnConsentDismissed / __xpnPlayStarted, then OVERLAYING them onto the monitor.SnapshotHealth()
+        // result with `with` before returning. This keeps the proof-marker readback OUT of FrameMonitor (D-24:
+        // FrameMonitor stays IFrameSource-only and never reads page JS); the markers are composed HERE per the
+        // cross-component WireHealth precedent ("wire the /health fields the monitor does not own"). The probe
+        // is read-only with a short timeout — a read miss leaves the field null (degraded observability, never
+        // a 500). These markers are OBSERVABILITY ONLY: none is wired into UseFallback (D-14 / Pitfall 5 —
+        // targetPresent=false strobes on SPA re-render). T-3-09: operational booleans only, no URL/content.
+        app.MapGet("/health", async () =>
+        {
+            var snapshot = monitor.SnapshotHealth();
+
+            // Sibling probe: read the three page proof markers off the MAIN frame (each null on a miss).
+            var targetPresent = await ReadMainBoolAsync(browserWrapper, "__xpnTargetPresent");
+            var consentDismissed = await ReadMainBoolAsync(browserWrapper, "__xpnConsentDismissed");
+            var playStarted = await ReadMainBoolAsync(browserWrapper, "__xpnPlayStarted");
+
+            return snapshot with
+            {
+                TargetPresent = targetPresent,
+                ConsentDismissed = consentDismissed,
+                PlayStarted = playStarted,
+            };
+        }).WithOpenApi();
 
         app.Run();
 
@@ -2106,6 +2130,43 @@ public class Program
         var browser = wrapper.Browser;
         if (browser is null) { return; }
         try { await browser.EvaluateScriptAsync(js); } catch { }
+    }
+
+    /// <summary>
+    /// 03-03 (D-24): READ a boolean JS proof marker on the MAIN frame ONCE, returning <c>true</c>/<c>false</c>
+    /// for a clean read or <c>null</c> on a read miss (browser not ready, eval failure, throwing/redefined
+    /// marker, or a non-bool result). The SIBLING CDP proof-marker probe composed at <c>/health</c> uses this
+    /// to read <c>window.__xpnTargetPresent</c>/<c>__xpnConsentDismissed</c>/<c>__xpnPlayStarted</c> — reusing
+    /// the existing <c>EvaluateScriptAsync</c> machinery (the <see cref="PollMainFlagAsync"/> shape, no new CDP
+    /// code). The payload is a STATIC <c>!!(window.__xpn*)</c> boolean coercion run IN the page; the RESULT is
+    /// read as a .NET bool (T-3-09b: a hostile getter can at worst spoof its OWN proof bool, never reach our
+    /// control plane). On a miss the field is left null (degraded observability — never a control-flow hazard;
+    /// these markers are observability ONLY, never wired into UseFallback, D-14). Bounded by a short timeout so
+    /// a slow/hung page cannot stall the /health response.
+    /// </summary>
+    private static async Task<bool?> ReadMainBoolAsync(CefWrapper wrapper, string globalName, int timeoutMs = 300)
+    {
+        var browser = wrapper.Browser;
+        if (browser is null) { return null; }
+
+        try
+        {
+            var evalTask = browser.EvaluateScriptAsync($"!!(window.{globalName})");
+            var timeoutTask = Task.Delay(timeoutMs);
+            if (await Task.WhenAny(evalTask, timeoutTask) != evalTask)
+            {
+                return null; // read miss — leave the field null (degraded observability, D-24).
+            }
+
+            var resp = await evalTask;
+            if (resp.Success && resp.Result is bool b)
+            {
+                return b;
+            }
+        }
+        catch { /* read miss — null */ }
+
+        return null;
     }
 
     /// <summary>

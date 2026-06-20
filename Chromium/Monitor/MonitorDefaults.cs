@@ -45,4 +45,38 @@ public static class MonitorDefaults
     /// transparency without admitting genuinely opaque pixels.
     /// </summary>
     public const byte AlphaZeroThreshold = 4;
+
+    // ── D-13/D-24 LIVENESS-BEACON region (the by-value contract with InjectHook's injected canvas) ──
+    //
+    // The injected beacon (InjectHook.BuildPayload, BeaconSizePx) is a fixed 16x16 canvas pinned to the
+    // TOP-LEFT corner (0,0) that draws OPAQUE-RGB content mutating every rAF tick over an alpha-0
+    // background. The FrameMonitor samples the CENTER of that region off the copied straight front buffer
+    // and compares consecutive ticks to derive beacon liveness (ticking / frozen / absent). These coords
+    // are DUPLICATED BY VALUE (not by a shared reference — FrameMonitor is CEF/Inject-agnostic, D-02, and
+    // must not import the Inject type) from InjectHook.BeaconSizePx; keep the two in sync.
+
+    /// <summary>D-13: the beacon canvas X origin in the captured buffer (top-left corner placement).</summary>
+    public const int BeaconOriginX = 0;
+
+    /// <summary>D-13: the beacon canvas Y origin in the captured buffer (top-left corner placement).</summary>
+    public const int BeaconOriginY = 0;
+
+    /// <summary>D-13: the beacon canvas edge length (must match InjectHook.BeaconSizePx).</summary>
+    public const int BeaconSizePx = 16;
+
+    /// <summary>
+    /// D-13: the per-channel RGB delta (summed over the sampled beacon pixels) above which the beacon
+    /// counts as "ticking" (changed since the prior sample). The injected bar mutates R/G/B by
+    /// tens-of-counts each tick, so a small bound cleanly separates a real tick from sampling noise while
+    /// a frozen (identical) beacon reads 0. Tuned conservatively in Phase 3 if needed.
+    /// </summary>
+    public const int BeaconChangeBound = 6;
+
+    /// <summary>
+    /// D-13: the minimum summed OPAQUE-RGB energy (over the sampled beacon pixels) at/above which the
+    /// beacon region is treated as PRESENT. Below it the region is ABSENT (never injected / failed to arm),
+    /// which MUST degrade to the dHash + paint-age backstop and NEVER false-trip on "beacon absent" (D-13).
+    /// A real beacon draws an opaque bar, so its RGB energy is well above 0.
+    /// </summary>
+    public const int BeaconPresenceFloor = 1;
 }

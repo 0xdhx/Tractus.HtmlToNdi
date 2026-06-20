@@ -141,6 +141,47 @@ public sealed record HealthSnapshot
     [JsonPropertyName("lastTransition")]
     public required TransitionInfo LastTransition { get; init; }
 
+    // ── 03-03 (D-03/D-06/D-13/D-24) ADDITIVE proof-marker fields ──
+    // Optional (nullable, NOT `required`) so the cold path + non-motion recipes + a /health read-miss all
+    // serialize cleanly with the field simply ABSENT (the RecipeUrlMatch L112 / FallbackReason L136 optional
+    // shape). These are OBSERVABILITY ONLY — none is ever wired into UseFallback (D-14 / T-3-08): targetPresent
+    // strobes on SPA re-render, so auto-acting on it would flap the fallback. Information-disclosure (T-3-09):
+    // operational booleans / 3-state token ONLY — never the full URL or page content (T-2-06-1).
+
+    /// <summary>
+    /// D-03/D-06 (VAL-01): whether the recipe's target selector resolves AND is isolated (full-bleed). Composed
+    /// at <c>/health</c> by the SIBLING CDP probe (Program.cs, D-24) reading <c>window.__xpnTargetPresent</c> —
+    /// NOT by FrameMonitor (which stays IFrameSource-only). Null on a read miss / no-motion / cold path.
+    /// OBSERVABILITY ONLY — never wired into UseFallback (D-14).
+    /// </summary>
+    [JsonPropertyName("targetPresent")]
+    public bool? TargetPresent { get; init; }
+
+    /// <summary>
+    /// D-13: the MONITOR-OWNED (pixel-sampled) 3-state liveness of the injected beacon — serialized as the
+    /// STRING token <c>"true"</c> / <c>"false"</c> / <c>"absent"</c> (never an integer, D-32 discipline) via
+    /// <see cref="BeaconLiveness"/>'s kebab converter. Set directly in <see cref="FrameMonitor.SnapshotHealth"/>.
+    /// Null when no motion is expected (the beacon is only injected on expectMotion recipes, D-15).
+    /// </summary>
+    [JsonPropertyName("beaconAlive")]
+    public BeaconLiveness? BeaconAlive { get; init; }
+
+    /// <summary>
+    /// D-06 (VAL-01): whether the recipe's consent/CMP dismissal landed. Composed at <c>/health</c> by the
+    /// SIBLING CDP probe reading <c>window.__xpnConsentDismissed</c> (set by the recipe js) — NOT FrameMonitor.
+    /// Null on a read miss / no marker. OBSERVABILITY ONLY.
+    /// </summary>
+    [JsonPropertyName("consentDismissed")]
+    public bool? ConsentDismissed { get; init; }
+
+    /// <summary>
+    /// D-06 (VAL-01): whether the recipe's play/animation start dispatch landed. Composed at <c>/health</c> by
+    /// the SIBLING CDP probe reading <c>window.__xpnPlayStarted</c> (set by the recipe js) — NOT FrameMonitor.
+    /// Null on a read miss / no marker. OBSERVABILITY ONLY.
+    /// </summary>
+    [JsonPropertyName("playStarted")]
+    public bool? PlayStarted { get; init; }
+
     /// <summary>The {ts, reason} shape of the most recent state transition.</summary>
     public sealed record TransitionInfo
     {
@@ -152,6 +193,26 @@ public sealed record HealthSnapshot
         [JsonPropertyName("reason")]
         public required string Reason { get; init; }
     }
+}
+
+/// <summary>
+/// D-13: the MONITOR-OWNED 3-state liveness of the injected liveness beacon, serialized on <c>/health</c>
+/// as a STRING token (never an integer, D-32) — <c>"true"</c> (beacon ticking: real RGB mutation seen this
+/// sample), <c>"false"</c> (beacon FROZEN: RGB unchanged while motion is expected — the genuine-freeze signal
+/// that feeds the K-in counter, D-25), or <c>"absent"</c> (no beacon detected — degrades to the dHash + paint
+/// backstop, NEVER a false trip, D-13). The single-word names kebab-lower to exactly these tokens.
+/// </summary>
+[JsonConverter(typeof(KebabCaseStringEnumConverter))]
+public enum BeaconLiveness
+{
+    /// <summary>Beacon RGB changed since the prior sample — alive/ticking. Token <c>"true"</c>.</summary>
+    True,
+
+    /// <summary>Beacon RGB unchanged while motion is expected — FROZEN (genuine freeze). Token <c>"false"</c>.</summary>
+    False,
+
+    /// <summary>No beacon liveness detected (never injected/armed). Token <c>"absent"</c> — backstop governs.</summary>
+    Absent,
 }
 
 /// <summary>
