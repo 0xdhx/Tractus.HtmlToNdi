@@ -122,6 +122,18 @@ public class CefWrapper : IDisposable, IFrameSource
     public int CapturedWidth => this.capturedWidth;
     public int CapturedHeight => this.capturedHeight;
 
+    // RC-3 / D-29d (MON-01): our OWN reusable straight-alpha buffer. CEF's OnPaint surface is
+    // PREMULTIPLIED BGRA (02-UAT.md L1 confirmed) but the locked wire format is BGRA STRAIGHT
+    // (CLAUDE.md; AlphaConvention.Expected = Straight). OnBrowserPaint un-premultiplies e.BufferHandle
+    // (CEF-owned, callback-scoped, may be reused — NEVER mutated in place) INTO this buffer BEFORE the
+    // pre-send capture, so the --onpaint-format gate and the FrameReady FramePump/detectors all read
+    // straight bytes, matching the already-straight FallbackProvider frames. Sized Height*Width*4 and
+    // re-allocated ONLY on a geometry change (mirrors the FrameMonitor reallocation discipline) — NOT a
+    // per-frame `new byte[]` on the hot path, so the conversion adds no GC jitter (D-30).
+    private byte[]? straightBuffer;
+    private int straightWidth;
+    private int straightHeight;
+
     public CefWrapper(int width, int height, string initialUrl)
     {
         this.Width = width;
@@ -273,73 +285,109 @@ public class CefWrapper : IDisposable, IFrameSource
         };
     }
 
-    private void OnBrowserPaint(object? sender, OnPaintEventArgs e)
+    private unsafe void OnBrowserPaint(object? sender, OnPaintEventArgs e)
     {
-        // D-29a (MON-01): pre-send capture for the --onpaint-format gate, taken BEFORE the
-        // NdiSenderPtr==Zero guard below — the only place the REAL pre-send OnPaint bytes are reachable
-        // with no NDI sender attached (lastPaint/:225 and FrameReady/:248 are both downstream of the
-        // guard). One-shot + blank-skipping (a never-painting SwiftShader init must not count). On the
-        // normal path CaptureNextPaint is false and this block is skipped entirely.
-        if (this.CaptureNextPaint && !this.capturedPaint)
-        {
-            if (!IsBlankBuffer(e.BufferHandle, e.Width, e.Height))
-            {
-                var byteCount = checked(e.Width * e.Height * 4);
-                var copy = new byte[byteCount];
-                System.Runtime.InteropServices.Marshal.Copy(e.BufferHandle, copy, 0, byteCount);
-                this.capturedBuffer = copy;
-                this.capturedWidth = e.Width;
-                this.capturedHeight = e.Height;
-                this.capturedPaint = true;
-                this.paintCaptured.TrySetResult(true);
-            }
-        }
-
-        if (Program.NdiSenderPtr == nint.Zero)
+        if (e.BufferHandle == nint.Zero || e.Width <= 0 || e.Height <= 0)
         {
             return;
         }
 
-        var browser = sender as ChromiumWebBrowser;
-
-        if (browser is null)
+        // RC-3 / D-29d (MON-01): un-premultiply FIRST, before ANYTHING downstream reads the bytes. CEF's
+        // OnPaint surface is PREMULTIPLIED BGRA (02-UAT.md L1) but the locked convention is STRAIGHT
+        // (AlphaConvention.Expected). Re-allocate our own buffer ONLY on a geometry change (not per
+        // frame — D-30 zero-jitter), then convert e.BufferHandle (CEF-owned, read-only, never mutated in
+        // place) into it. From here on, EVERY reader — the D-29a capture, the smoke/blank checks, and the
+        // FrameReady FramePump/detectors — reads `this.straightBuffer`, so the whole pipeline agrees with
+        // the already-straight FallbackProvider frames on one convention. The send-path BGRA fourCC is
+        // unchanged (the bytes are still BGRA, now correctly straight); the live XPression-keyer
+        // validation (VAL-02) remains Phase 3 per D-29d.
+        var byteCount = checked(e.Width * e.Height * 4);
+        if (this.straightBuffer is null || this.straightWidth != e.Width || this.straightHeight != e.Height)
         {
-            return;
+            this.straightBuffer = new byte[byteCount];
+            this.straightWidth = e.Width;
+            this.straightHeight = e.Height;
         }
 
-        // RC-1 (02-07): UTC paint stamp. LastPaint (the IFrameSource liveness clock the FrameMonitor reads
-        // in Classify/SnapshotHealth on its DateTime.UtcNow default) MUST share the monitor's UTC basis —
-        // DateTime.Now (LOCAL) on a UTC-offset host made every fresh frame look ~5h stale (the L2/L4
-        // blocker/major in 02-UAT.md). Never-painted sentinel stays DateTime.MinValue (set at the field).
-        this.lastPaint = DateTime.UtcNow;
+        var src = new ReadOnlySpan<byte>((void*)e.BufferHandle, byteCount);
+        Monitor.UnpremultiplyLut.Unpremultiply(src, this.straightBuffer, e.Width, e.Height);
 
-        // D-15b: one-shot smoke latch. Under --smoke we send EXACTLY ONE non-blank frame, then
-        // signal completion and suppress all further sends. A black/all-zero first paint does
-        // NOT count as the one good frame (D-15c blank-buffer guard). On the normal path
-        // (SmokeMode == false) this whole block is skipped and the send below is unchanged.
-        if (this.SmokeMode)
+        // Pin our straight buffer for the rest of this callback so its address can be handed to the
+        // capture copy, the blank checks, and the FrameView (all of which take an nint). The pin lives
+        // exactly for the callback scope — the FrameView pointer contract (callback-scoped) is preserved.
+        fixed (byte* straightPtr = this.straightBuffer)
         {
-            if (this.smokeSent)
+            var straight = (nint)straightPtr;
+
+            // D-29a (MON-01): pre-send capture for the --onpaint-format gate, taken BEFORE the
+            // NdiSenderPtr==Zero guard below — the only place the pre-send OnPaint bytes are reachable
+            // with no NDI sender attached. Now copies from OUR STRAIGHT buffer (not CEF's premultiplied
+            // one), so the gate's CapturedBuffer readback samples straight: the 50%-alpha red region reads
+            // R≈255 -> observed = Straight -> matches AlphaConvention.Expected -> the gate exits 0.
+            // One-shot + blank-skipping (a never-painting SwiftShader init must not count). On the normal
+            // path CaptureNextPaint is false and this block is skipped entirely.
+            if (this.CaptureNextPaint && !this.capturedPaint)
+            {
+                if (!IsBlankBuffer(straight, e.Width, e.Height))
+                {
+                    var copy = new byte[byteCount];
+                    System.Runtime.InteropServices.Marshal.Copy(straight, copy, 0, byteCount);
+                    this.capturedBuffer = copy;
+                    this.capturedWidth = e.Width;
+                    this.capturedHeight = e.Height;
+                    this.capturedPaint = true;
+                    this.paintCaptured.TrySetResult(true);
+                }
+            }
+
+            if (Program.NdiSenderPtr == nint.Zero)
             {
                 return;
             }
 
-            if (IsBlankBuffer(e.BufferHandle, e.Width, e.Height))
+            var browser = sender as ChromiumWebBrowser;
+
+            if (browser is null)
             {
-                // Not a usable frame yet — wait for a non-blank paint (the watchdog re-invalidates).
                 return;
             }
-        }
 
-        // D-01/D-25: this wrapper is the SOURCE — it RAISES the frame-ready event with a primitive,
-        // callback-scoped view. The subscribed NdiFrameSink does the actual NDIlib send (the send was
-        // extracted out of this hot path). The buffer pointer is valid only for this invocation.
-        this.FrameReady?.Invoke(new FrameView(e.BufferHandle, e.Width, e.Height, e.Width * 4));
+            // RC-1 (02-07): UTC paint stamp. LastPaint (the IFrameSource liveness clock the FrameMonitor
+            // reads in Classify/SnapshotHealth on its DateTime.UtcNow default) MUST share the monitor's UTC
+            // basis — DateTime.Now (LOCAL) on a UTC-offset host made every fresh frame look ~5h stale (the
+            // L2/L4 blocker/major in 02-UAT.md). Never-painted sentinel stays DateTime.MinValue.
+            this.lastPaint = DateTime.UtcNow;
 
-        if (this.SmokeMode && !this.smokeSent)
-        {
-            this.smokeSent = true;
-            this.smokeFrameSent.TrySetResult(true);
+            // D-15b: one-shot smoke latch. Under --smoke we send EXACTLY ONE non-blank frame, then
+            // signal completion and suppress all further sends. A black/all-zero first paint does
+            // NOT count as the one good frame (D-15c blank-buffer guard). Reads our straight buffer for
+            // consistency (alpha-0 and all-black are basis-invariant, so the classification is unchanged).
+            // On the normal path (SmokeMode == false) this whole block is skipped and the send is unchanged.
+            if (this.SmokeMode)
+            {
+                if (this.smokeSent)
+                {
+                    return;
+                }
+
+                if (IsBlankBuffer(straight, e.Width, e.Height))
+                {
+                    // Not a usable frame yet — wait for a non-blank paint (the watchdog re-invalidates).
+                    return;
+                }
+            }
+
+            // D-01/D-25: this wrapper is the SOURCE — it RAISES the frame-ready event with a primitive,
+            // callback-scoped view. The subscribed FramePump/monitor copies the bytes in-call. The view now
+            // points at OUR STRAIGHT buffer (same geometry/stride: Width, Height, Width*4) — the pointer is
+            // valid only for this invocation (the pin above covers exactly the callback scope).
+            this.FrameReady?.Invoke(new FrameView(straight, e.Width, e.Height, e.Width * 4));
+
+            if (this.SmokeMode && !this.smokeSent)
+            {
+                this.smokeSent = true;
+                this.smokeFrameSent.TrySetResult(true);
+            }
         }
     }
 
