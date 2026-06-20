@@ -192,6 +192,14 @@ public sealed class FrameMonitor : IDisposable
     /// <summary>Default bounded refresh attempts before RECOVERY-EXHAUSTED (D-13).</summary>
     public const int DefaultMaxRefreshAttempts = 3;
 
+    /// <summary>
+    /// RC-1 (02-07): the FINITE high cold-path floor for <see cref="HealthSnapshot.LastPaintAgeMs"/> before the
+    /// first paint — replaces the un-serializable <c>double.PositiveInfinity</c> that threw → cold-path HTTP 500.
+    /// 1h sits comfortably above any production <c>freezeTimeoutMs</c> (D-10 ~10s), so the cold path reads
+    /// "very stale, not dead" (D-24) and never as a fresh/healthy paint.
+    /// </summary>
+    private const double ColdAgeFloorMs = 60.0 * 60.0 * 1000.0;
+
     /// <summary>Cooldown after a refresh before another may be issued (single-flight settle, D-13).</summary>
     private const int RefreshCooldownMs = 3000;
 
@@ -369,11 +377,28 @@ public sealed class FrameMonitor : IDisposable
         // clock the cadence check uses and the true wedged-renderer signal — a wedged renderer never advances
         // LastPaint, so this climbs high on a freeze while the process still answers 200. Using the source paint
         // clock (not the wall-clock copy stamp) keeps it consistent with the injected `now` for determinism AND
-        // is the real liveness signal (the copy stamp can lag/lead the injected clock). Never-painted ⇒ +∞.
+        // is the real liveness signal (the copy stamp can lag/lead the injected clock).
+        //
+        // RC-1 (02-07) COLD-PATH FINITE SENTINEL: before the first paint (LastPaint == DateTime.MinValue) the
+        // age was double.PositiveInfinity — which System.Text.Json refuses to serialize → the live cold-path
+        // HTTP 500 (02-UAT.md L4). Replace it with a FINITE HIGH age so /health answers 200 throughout startup
+        // while still reading "very stale, not dead" (D-24). Derive it from uptime when processStartTs is wired
+        // (mirroring the finite UptimeSec below), clamped to a large floor; fall back to that floor when unset.
+        // ColdAgeFloorMs (1h) sits comfortably above any production freezeTimeoutMs (D-10 ~10s), so the cold
+        // path can never be misread as a fresh/healthy paint.
         var lastPaint = this.source.LastPaint;
-        var lastPaintAgeMs = lastPaint == DateTime.MinValue
-            ? double.PositiveInfinity
-            : (now - lastPaint).TotalMilliseconds;
+        double lastPaintAgeMs;
+        if (lastPaint == DateTime.MinValue)
+        {
+            var coldFromUptime = this.processStartTs == DateTime.MinValue
+                ? 0
+                : (now - this.processStartTs).TotalMilliseconds;
+            lastPaintAgeMs = Math.Max(ColdAgeFloorMs, coldFromUptime);
+        }
+        else
+        {
+            lastPaintAgeMs = (now - lastPaint).TotalMilliseconds;
+        }
 
         lock (this.stateLock)
         {

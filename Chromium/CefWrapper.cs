@@ -152,7 +152,11 @@ public class CefWrapper : IDisposable, IFrameSource
     {
         while (!this.disposedValue)
         {
-            if(DateTime.Now.Subtract(this.lastPaint).TotalSeconds >= 1.0)
+            // RC-1 (02-07): UTC basis. The watchdog's internal 1.0s invalidation compares against the
+            // same `lastPaint` the FrameMonitor reads on its DateTime.UtcNow clock — both sides MUST be
+            // UTC or a host UTC-offset (e.g. UTC-5) re-introduces a cross-component skew that misreads a
+            // fresh paint as stale. Stamp (:306) and compare (here) are unified on DateTime.UtcNow.
+            if(DateTime.UtcNow.Subtract(this.lastPaint).TotalSeconds >= 1.0)
             {
                 this.browser.GetBrowser().GetHost().Invalidate(PaintElementType.View);
             }
@@ -303,7 +307,11 @@ public class CefWrapper : IDisposable, IFrameSource
             return;
         }
 
-        this.lastPaint = DateTime.Now;
+        // RC-1 (02-07): UTC paint stamp. LastPaint (the IFrameSource liveness clock the FrameMonitor reads
+        // in Classify/SnapshotHealth on its DateTime.UtcNow default) MUST share the monitor's UTC basis —
+        // DateTime.Now (LOCAL) on a UTC-offset host made every fresh frame look ~5h stale (the L2/L4
+        // blocker/major in 02-UAT.md). Never-painted sentinel stays DateTime.MinValue (set at the field).
+        this.lastPaint = DateTime.UtcNow;
 
         // D-15b: one-shot smoke latch. Under --smoke we send EXACTLY ONE non-blank frame, then
         // signal completion and suppress all further sends. A black/all-zero first paint does
