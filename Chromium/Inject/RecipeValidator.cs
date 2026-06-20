@@ -47,7 +47,35 @@ public sealed class RecipeValidator
         "fallbackPolicy",
         "expectMotion",
         "expectsCrossOriginIframes",
+        // D-33 — the optional fallback ASSET filename (validated bare-filename, resolved in --fallback-dir).
+        "fallbackAsset",
+        // D-19 — the per-recipe detection-TIMING / hysteresis knobs the Plan-05 state machine reads.
+        // MANDATORY here or a recipe carrying any of them trips the unknown-key rejection below. (The
+        // detection-SENSITIVITY thresholds — Hamming bound / variance epsilon — stay GLOBAL, Plan 03.)
+        "freezeTimeoutMs",
+        "minHoldMs",
+        "hysteresisKIn",
+        "hysteresisKOut",
     };
+
+    /// <summary>
+    /// D-20: the allowed <c>fallbackPolicy</c> keywords. Absent ⇒ the default <c>slate</c>. Any other
+    /// value is a fail-closed structured error (the enforced enum). Matched case-insensitively.
+    /// </summary>
+    public const string DefaultFallbackPolicy = "slate";
+
+    private static readonly HashSet<string> FallbackPolicies = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "slate",
+        "black",
+        "hold-last",
+    };
+
+    /// <summary>D-19 sane upper bound for the timing fields (24 h in ms) — rejects absurd values.</summary>
+    public const int MaxTimingMs = 24 * 60 * 60 * 1000;
+
+    /// <summary>D-16 sane upper bound for the hysteresis frame-counts — rejects absurd values.</summary>
+    public const int MaxHysteresisFrames = 100000;
 
     /// <summary>
     /// Parse + validate + normalize a RAW recipe JSON string into the internal <see cref="Recipe"/>
@@ -119,8 +147,32 @@ public sealed class RecipeValidator
             var js = ReadString(root, "js", errors);
             var targetSelector = ReadString(root, "targetSelector", errors);
             var fallbackPolicy = ReadString(root, "fallbackPolicy", errors);
+            var fallbackAsset = ReadString(root, "fallbackAsset", errors);
             var expectMotion = ReadBool(root, "expectMotion", errors);
             var expectsCrossOriginIframes = ReadBool(root, "expectsCrossOriginIframes", errors);
+
+            // D-19: the optional/defaulted detection-timing + hysteresis knobs. Each is a non-negative
+            // int within a sane upper bound; absent ⇒ the Recipe record's default. Fail-closed.
+            var freezeTimeoutMs = ReadInt(root, "freezeTimeoutMs", 0, MaxTimingMs, errors);
+            var minHoldMs = ReadInt(root, "minHoldMs", 0, MaxTimingMs, errors);
+            var hysteresisKIn = ReadInt(root, "hysteresisKIn", 0, MaxHysteresisFrames, errors);
+            var hysteresisKOut = ReadInt(root, "hysteresisKOut", 0, MaxHysteresisFrames, errors);
+
+            // D-20: fallbackPolicy enum membership ∈ {slate, black, hold-last}. Absent ⇒ default slate.
+            // An unknown keyword is a fail-closed structured error.
+            if (fallbackPolicy is not null && !FallbackPolicies.Contains(fallbackPolicy))
+            {
+                errors.Add(
+                    $"recipe field 'fallbackPolicy' must be one of slate|black|hold-last (got '{fallbackPolicy}')");
+            }
+
+            // D-33: fallbackAsset must be a BARE filename — no path separator, no traversal. The on-disk
+            // path-traversal guard is re-applied at load in FallbackProvider (defence-in-depth).
+            if (fallbackAsset is not null && !IsValidAssetFilename(fallbackAsset))
+            {
+                errors.Add(
+                    $"recipe field 'fallbackAsset' must be a bare filename (no path separator or '..'): '{fallbackAsset}'");
+            }
 
             // urlMatch: required, and a legal host + optional path glob (D-05). NOT a regex.
             if (string.IsNullOrWhiteSpace(urlMatch))
@@ -148,7 +200,14 @@ public sealed class RecipeValidator
                 Css = css,
                 Js = js,
                 TargetSelector = targetSelector,
-                FallbackPolicy = fallbackPolicy,
+                // D-20: normalize an absent fallbackPolicy to the default keyword so downstream consumers
+                // (Plan 04 FallbackProvider) read a single canonical value, never null.
+                FallbackPolicy = fallbackPolicy ?? DefaultFallbackPolicy,
+                FallbackAsset = fallbackAsset,
+                FreezeTimeoutMs = freezeTimeoutMs ?? Recipe.DefaultFreezeTimeoutMs,
+                MinHoldMs = minHoldMs ?? Recipe.DefaultMinHoldMs,
+                HysteresisKIn = hysteresisKIn ?? Recipe.DefaultHysteresisKIn,
+                HysteresisKOut = hysteresisKOut ?? Recipe.DefaultHysteresisKOut,
                 ExpectMotion = expectMotion ?? false,
                 ExpectsCrossOriginIframes = expectsCrossOriginIframes ?? false,
             };
@@ -287,5 +346,75 @@ public sealed class RecipeValidator
                 errors.Add($"recipe field '{name}' must be a boolean");
                 return null;
         }
+    }
+
+    /// <summary>
+    /// D-19 numeric-bounds reader mirroring <see cref="ReadBool"/>: reads an optional integer field
+    /// within <paramref name="min"/>..<paramref name="max"/> (inclusive). Absent ⇒ <c>null</c> (the
+    /// caller applies the Recipe default). A non-integer, fractional, or out-of-range value is a
+    /// fail-closed structured error (no partial apply, D-12).
+    /// </summary>
+    private static int? ReadInt(JsonElement root, string name, int min, int max, List<string> errors)
+    {
+        if (!root.TryGetProperty(name, out var el))
+        {
+            return null;
+        }
+
+        if (el.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        if (el.ValueKind != JsonValueKind.Number || !el.TryGetInt32(out var value))
+        {
+            errors.Add($"recipe field '{name}' must be an integer");
+            return null;
+        }
+
+        if (value < min || value > max)
+        {
+            errors.Add($"recipe field '{name}' must be between {min} and {max} (got {value})");
+            return null;
+        }
+
+        return value;
+    }
+
+    /// <summary>
+    /// D-33 fallbackAsset sanity: the recipe-supplied value must be a BARE filename — no directory
+    /// separator (either slash), no <c>..</c> traversal segment, no rooted path, no control chars. This
+    /// is the FIRST of two guards; the on-disk <c>Path.GetFullPath</c> containment check is re-applied at
+    /// load in <c>FallbackProvider</c> (defence-in-depth, threat T-2-04-1).
+    /// </summary>
+    private static bool IsValidAssetFilename(string fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        if (fileName.Contains('/', StringComparison.Ordinal)
+            || fileName.Contains('\\', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (fileName.Contains("..", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (Path.IsPathRooted(fileName))
+        {
+            return false;
+        }
+
+        if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            return false;
+        }
+
+        return true;
     }
 }

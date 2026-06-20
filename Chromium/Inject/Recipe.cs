@@ -51,8 +51,63 @@ public sealed record Recipe
     /// <summary>Optional selector identifying the target element a recipe isolates/fills.</summary>
     public string? TargetSelector { get; init; }
 
-    /// <summary>P1 DATA ONLY (consumed by the Phase-2 monitor). The fallback-graphic policy.</summary>
+    /// <summary>
+    /// The fallback-graphic policy keyword (D-20). Stored as <see cref="string"/> (the validator enforces
+    /// the enum membership ∈ {<c>slate</c>, <c>black</c>, <c>hold-last</c>} — the same discipline as
+    /// <see cref="UrlMatch"/> being a validator-checked string). Absent ⇒ the default <c>slate</c> is
+    /// applied by the validator. The Phase-2 fallback path (Plan 04 <c>FallbackProvider</c>) selects
+    /// behavior off this keyword: <c>slate</c> = the configured <see cref="FallbackAsset"/>/<c>slate.png</c>
+    /// graphic (or a generated slate when absent/invalid), <c>black</c> = generated opaque black,
+    /// <c>hold-last</c> = the monitor holds the last-good live frame.
+    /// </summary>
     public string? FallbackPolicy { get; init; }
+
+    /// <summary>
+    /// OPTIONAL (D-33). The fallback ASSET filename resolved within <c>--fallback-dir</c> for a
+    /// <see cref="FallbackPolicy"/>=<c>slate</c> recipe. Validated as a BARE filename only (no path
+    /// separator, no <c>..</c>) by <see cref="RecipeValidator"/>; the on-disk path-traversal guard is
+    /// re-applied at load in the <c>FallbackProvider</c> (defence-in-depth). When absent, convention is
+    /// <c>slate.png</c>; a missing/invalid asset degrades to the in-memory generated default (D-20b).
+    /// </summary>
+    public string? FallbackAsset { get; init; }
+
+    /// <summary>
+    /// OPTIONAL/DEFAULTED (D-19). Milliseconds with no fresh paint after which the page is treated as
+    /// frozen by the Plan-05 recovery state machine. Default <see cref="DefaultFreezeTimeoutMs"/> when
+    /// absent. A DETECTION-TIMING knob (not a sensitivity threshold — those stay global, Plan 03).
+    /// </summary>
+    public int FreezeTimeoutMs { get; init; } = DefaultFreezeTimeoutMs;
+
+    /// <summary>
+    /// OPTIONAL/DEFAULTED (D-19). The minimum milliseconds the fallback must be HELD on air once entered
+    /// (anti-flap min-hold, D-16). Default <see cref="DefaultMinHoldMs"/> when absent.
+    /// </summary>
+    public int MinHoldMs { get; init; } = DefaultMinHoldMs;
+
+    /// <summary>
+    /// OPTIONAL/DEFAULTED (D-19). Consecutive BAD frames required to ENTER fallback (hysteresis K-in,
+    /// D-10/D-16). Default <see cref="DefaultHysteresisKIn"/> when absent.
+    /// </summary>
+    public int HysteresisKIn { get; init; } = DefaultHysteresisKIn;
+
+    /// <summary>
+    /// OPTIONAL/DEFAULTED (D-19). Consecutive GOOD frames required to EXIT fallback (hysteresis K-out,
+    /// deliberately larger than K-in so recovery is conservative, D-10/D-16). Default
+    /// <see cref="DefaultHysteresisKOut"/> when absent.
+    /// </summary>
+    public int HysteresisKOut { get; init; } = DefaultHysteresisKOut;
+
+    /// <summary>Default <see cref="FreezeTimeoutMs"/> (~10 s) when the recipe omits it (D-10/D-16).</summary>
+    public const int DefaultFreezeTimeoutMs = 10000;
+
+    /// <summary>Default <see cref="MinHoldMs"/> (~2 s) when the recipe omits it (D-16 anti-flap).</summary>
+    public const int DefaultMinHoldMs = 2000;
+
+    /// <summary>Default <see cref="HysteresisKIn"/> (small — fast enter) when the recipe omits it.</summary>
+    public const int DefaultHysteresisKIn = 3;
+
+    /// <summary>Default <see cref="HysteresisKOut"/> (larger — conservative exit) when the recipe omits it.</summary>
+    public const int DefaultHysteresisKOut = 10;
 
     /// <summary>P1 DATA ONLY (consumed by the Phase-2 monitor). Whether the page is expected to be in
     /// motion (informs frozen-frame detection thresholds).</summary>
