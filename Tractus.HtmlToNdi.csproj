@@ -28,6 +28,11 @@
   </ItemGroup>
 	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+		<!-- 02-04: the Windows Desktop framework brings System.Drawing.Common (Bitmap/LockBits) for the
+		     fallback PNG decode. An IN-BOX framework reference on net8.0-windows, NOT a new NuGet package
+		     (threat T-2-SC: no install task). The in-box System.Drawing.Primitives only carries
+		     Size/Rectangle; Bitmap lives in System.Drawing.Common, shipped by this framework. -->
+		<FrameworkReference Include="Microsoft.WindowsDesktop.App" />
 	</ItemGroup>
   <ItemGroup>
     <PackageReference Include="CefSharp.OffScreen.NETCore" Version="148.0.90" />

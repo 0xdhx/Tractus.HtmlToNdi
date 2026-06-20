@@ -204,6 +204,28 @@ public class Program
             }
         }
 
+        // D-18: --fallback-dir <dir> — the ops-owned fallback-graphic directory (mirrors --recipe-dir),
+        // bundle-relative default. A policy=slate recipe loads its fallbackAsset (or slate.png) from here;
+        // a missing/invalid asset degrades LOUDLY to a generated default (D-20b). Parsed with the same
+        // StartsWith care as --recipe-dir (no other arg aliases "--fallback-dir").
+        var fallbackDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "fallbacks");
+        if (args.Any(x => x.StartsWith("--fallback-dir")))
+        {
+            try
+            {
+                fallbackDir = args.FirstOrDefault(x => x.StartsWith("--fallback-dir")).Split("=")[1];
+                if (string.IsNullOrWhiteSpace(fallbackDir))
+                {
+                    throw new ArgumentException();
+                }
+            }
+            catch (Exception)
+            {
+                Log.Error("Could not parse the --fallback-dir parameter. Exiting.");
+                return;
+            }
+        }
+
         // ── Two-phase recipe resolution, PHASE 1 (D-16 / Pitfall 4): load + match SYNCHRONOUSLY BEFORE
         // Cef.Initialize, because the matched recipe's ExpectsCrossOriginIframes gates the site-isolation
         // CefCommandLineArgs — flags added AFTER Cef.Initialize are silently ignored. Phase 2 (register
@@ -333,6 +355,25 @@ public class Program
         var monitor = new FrameMonitor(browserWrapper);
         var pump = new FramePump(monitor, Program.NdiSenderPtr);
         pump.Start();
+
+        // 02-04 fallback wiring (D-18/D-20/D-21/D-33) — REPLACES 02-02's seeded never-null placeholder
+        // in the monitor's fallback slot with the REAL validated/generated FallbackFrame. The provider
+        // loads the policy=slate asset (the startup recipe's fallbackAsset, else slate.png) from
+        // --fallback-dir at the ACTUAL --w/--h output geometry + the live alpha convention (byte-
+        // identical to live frames so the receiver never resyncs at the swap); ANY failure degrades to a
+        // generated slate/black surfaced LOUDLY. fallbackAssetState is what Plan 06's /health reports.
+        var fallbackProvider = new FallbackProvider(fallbackDir, width, height, AlphaConvention.Expected);
+        var fallbackResult = fallbackProvider.LoadOrGenerate(
+            startupRecipe?.FallbackPolicy, startupRecipe?.FallbackAsset);
+        monitor.SetFallbackFrame(
+            fallbackResult.Frame.Bgra, fallbackResult.Frame.Width, fallbackResult.Frame.Height);
+        var fallbackAssetState = fallbackResult.State;
+        Log.Information(
+            "FALLBACK ready — policy={Policy} asset={Asset} state={State} geom={W}x{H}",
+            startupRecipe?.FallbackPolicy ?? "slate",
+            fallbackResult.Sought,
+            fallbackAssetState == FallbackAssetState.Configured ? "configured" : "generated-default",
+            width, height);
 
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
