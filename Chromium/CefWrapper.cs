@@ -51,6 +51,18 @@ public class CefWrapper : IDisposable, IFrameSource
     internal ChromiumWebBrowser? Browser => this.browser;
 
     private Thread RenderWatchdog;
+
+    /// <summary>
+    /// 03-04 ([[cef-offscreen-needs-external-beginframe]]): the ~60fps external begin-frame DRIVER. With
+    /// <see cref="WindowInfo.ExternalBeginFrameEnabled"/> set at CreateBrowser, CEF produces NO frames (no
+    /// OnPaint at all) unless <c>SendExternalBeginFrame</c> is pumped — and that externally driven present
+    /// cadence is what advances render-gated WebGL players (the MapLibre radar) that CEF's INTERNAL
+    /// windowless begin-frame leaves frozen. Constructed in the ctor, started in
+    /// <see cref="InitializeWrapperAsync"/>, exits on <see cref="disposedValue"/> — same lifecycle as
+    /// <see cref="RenderWatchdog"/>. Reads <see cref="browser"/> fresh each tick, so a
+    /// <see cref="RecreateBrowserCoreAsync"/> swap is driven automatically with NO thread recreation.
+    /// </summary>
+    private Thread BeginFrameDriver;
     private DateTime lastPaint = DateTime.MinValue;
 
     /// <summary>
@@ -165,7 +177,25 @@ public class CefWrapper : IDisposable, IFrameSource
         // initialUrl straight to the browser, auto-loading it immediately — the D-16 root cause).
         this.startUrl = initialUrl;
 
-        this.browser = new ChromiumWebBrowser("about:blank", TransparentBrowserSettings())
+        // 03-04 fix: construct WITHOUT auto-creating the browser, then CreateBrowser on a windowless
+        // surface with ExternalBeginFrameEnabled (NewWindowlessExternalBeginFrameWindowInfo). The
+        // BrowserSettings passed here (TransparentBrowserSettings) is retained and applied by CreateBrowser.
+        // D-16 ordering is preserved — still about:blank, so the doc-start CDP script still registers before
+        // the first real Load in InitializeWrapperAsync.
+        //
+        // useLegacyRenderHandler:false MATCHES the validated spike probe (the spike that proved external
+        // begin-frame advances the radar used false). The default (true) installs the legacy
+        // DefaultRenderHandler — a Bitmap consumer for ScreenshotAsync; false leaves RenderHandler null. We
+        // consume the Paint EVENT (raised by ChromiumWebBrowser itself, independent of RenderHandler) and use
+        // no ScreenshotAsync/Bitmap, so a null RenderHandler is harmless. NOT independently confirmed as
+        // necessary: the residual freeze under the begin-frame fix turned out to be the recipe's play-click +
+        // hideChrome (fixed in recipes/accuweather.json), not this flag — kept to match the proven-good spike
+        // config and avoid the legacy handler's extra present-path bookkeeping. Revisit if minimizing the diff.
+        this.browser = new ChromiumWebBrowser(
+            "about:blank",
+            TransparentBrowserSettings(),
+            automaticallyCreateBrowser: false,
+            useLegacyRenderHandler: false)
         {
             AudioHandler = new CustomAudioHandler(),
         };
@@ -174,10 +204,14 @@ public class CefWrapper : IDisposable, IFrameSource
 
         // D-11/D-27: thin belt-and-suspenders re-assert — re-apply the FULL recipe Css ONLY at the
         // start of every frame load (never consent/JS through this path). Wired here so it survives
-        // browser recreate (re-wired in RecreateBrowserCoreAsync).
+        // browser recreate (re-wired in RecreateBrowserCoreAsync). Subscribed BEFORE CreateBrowser so no
+        // early FrameLoadStart is missed.
         this.browser.FrameLoadStart += this.OnFrameLoadStart;
 
+        this.browser.CreateBrowser(NewWindowlessExternalBeginFrameWindowInfo());
+
         this.RenderWatchdog = new Thread(this.RenderWatchDogThread);
+        this.BeginFrameDriver = new Thread(this.BeginFrameDriverThread);
     }
 
     private void RenderWatchDogThread()
@@ -197,12 +231,60 @@ public class CefWrapper : IDisposable, IFrameSource
         }
     }
 
+    /// <summary>
+    /// 03-04 ([[cef-offscreen-needs-external-beginframe]]) — the external begin-frame driver loop. Pumps
+    /// <c>SendExternalBeginFrame</c> at ~60fps for the lifetime of the wrapper. MANDATORY: with
+    /// <see cref="WindowInfo.ExternalBeginFrameEnabled"/> set, CEF emits no OnPaint at all without this.
+    /// Reads <see cref="browser"/> fresh each tick (like <see cref="RenderWatchDogThread"/>) so a
+    /// <see cref="RecreateBrowserCoreAsync"/> swap is picked up with NO thread recreation; the
+    /// null-conditional + try/catch ride the brief window where the host is mid-recreate or disposing.
+    /// </summary>
+    private void BeginFrameDriverThread()
+    {
+        while (!this.disposedValue)
+        {
+            try
+            {
+                this.browser?.GetBrowserHost()?.SendExternalBeginFrame();
+            }
+            catch
+            {
+                // best-effort — a transient/disposed host during a recreate must not kill the driver.
+            }
+
+            Thread.Sleep(16);
+        }
+    }
+
+    /// <summary>
+    /// 03-04 fix WindowInfo: a windowless surface whose begin-frame is driven EXTERNALLY by
+    /// <see cref="BeginFrameDriverThread"/>. <see cref="WindowInfo.WindowlessRenderingEnabled"/> keeps the
+    /// CPU OnPaint path (<see cref="WindowInfo.SharedTextureEnabled"/> stays false by default —
+    /// isolation-validated 03-04 — so the OnPaint → un-premult → BGRA-straight-alpha → NDI pipeline and the
+    /// locked wire format are UNCHANGED). <see cref="WindowInfo.ExternalBeginFrameEnabled"/> is the actual
+    /// fix: it hands the present cadence to the driver, which advances render-gated WebGL players (MapLibre
+    /// radar) that CEF's internal windowless begin-frame leaves frozen. Used at BOTH browser-creation sites.
+    /// </summary>
+    private static WindowInfo NewWindowlessExternalBeginFrameWindowInfo()
+    {
+        var windowInfo = new WindowInfo();
+        windowInfo.SetAsWindowless(IntPtr.Zero);
+        windowInfo.WindowlessRenderingEnabled = true;
+        windowInfo.ExternalBeginFrameEnabled = true;
+        return windowInfo;
+    }
+
     public async Task InitializeWrapperAsync()
     {
         if (this.browser is null)
         {
             return;
         }
+
+        // 03-04: start the external begin-frame driver FIRST — with ExternalBeginFrameEnabled set at
+        // CreateBrowser, CEF produces no frames (the about:blank surface never even presents) until
+        // SendExternalBeginFrame is pumped. Mirrors the spike's driver-before-wait ordering.
+        this.BeginFrameDriver.Start();
 
         // Resolves the about:blank load (D-16) — NOT a real document, so nothing the recipe targets has
         // rendered yet. Registration below therefore precedes the first real Load.
@@ -589,13 +671,22 @@ public class CefWrapper : IDisposable, IFrameSource
         }
 
         // step 3: recreate on about:blank (deferred Load — InjectHook re-registers before the caller Loads).
-        this.browser = new ChromiumWebBrowser("about:blank", TransparentBrowserSettings())
+        // 03-04: recreate on the SAME windowless + ExternalBeginFrameEnabled surface (site 2) AND with the
+        // SAME useLegacyRenderHandler:false (see the ctor note), else the long-lived BeginFrameDriver's
+        // SendExternalBeginFrame produces no paints for the new browser at all. The driver THREAD is NOT
+        // recreated — it reads this.browser fresh (like RenderWatchdog) and drives whichever browser is current.
+        this.browser = new ChromiumWebBrowser(
+            "about:blank",
+            TransparentBrowserSettings(),
+            automaticallyCreateBrowser: false,
+            useLegacyRenderHandler: false)
         {
             AudioHandler = new CustomAudioHandler(),
         };
         this.browser.Size = new System.Drawing.Size(this.Width, this.Height);
         this.browser.Paint += this.OnBrowserPaint;            // re-wire — preserves the FrameReady→sink path (step 6)
         this.browser.FrameLoadStart += this.OnFrameLoadStart; // re-wire the D-27 css re-assert
+        this.browser.CreateBrowser(NewWindowlessExternalBeginFrameWindowInfo());
 
         return this.browser.WaitForInitialLoadAsync().ContinueWith(_ => this.ForceVisible());
     }
