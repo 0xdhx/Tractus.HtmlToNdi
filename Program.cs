@@ -51,6 +51,18 @@ public class Program
             return; // unreachable — RunInjectSmoke always calls Environment.Exit.
         }
 
+        if (args.Any(x => x.StartsWith("--monitor-smoke")))
+        {
+            // D-09/D-34 (MON-02..05): the monitor self-healing acceptance gate. Detected BEFORE --smoke
+            // (StartsWith("--smoke") would NOT alias "--monitor-smoke") and before the interactive prompts
+            // (same stdin-hang hazard). Serves an rAF-canvas fixture that freezes on command over a loopback
+            // listener and drives the REAL CEF->FrameMonitor->FramePump pipeline through freeze->fallback->
+            // refresh+re-inject->recovery via a DEDICATED non-colliding recipe with smoke-scale tiny
+            // thresholds (D-34). Always Environment.Exit (0 on the full path succeeding, 1 otherwise).
+            RunMonitorSmoke(args, launchCachePath);
+            return; // unreachable — RunMonitorSmoke always calls Environment.Exit.
+        }
+
         if (args.Any(x => x.StartsWith("--onpaint-format")))
         {
             // D-22/D-29 (MON-01): the OnPaint pixel-format readback gate — the literal FIRST task of
@@ -1275,6 +1287,292 @@ public class Program
 
         Log.CloseAndFlush();
         Environment.Exit(exitCode);
+    }
+
+    /// <summary>
+    /// D-09/D-34 (MON-02..05): the monitor self-healing acceptance gate. Mirrors <see cref="RunInjectSmoke"/>'s
+    /// free-port loopback listener + CEF-init + bounded-poll + exit discipline, but proves the WHOLE
+    /// self-healing loop end to end on a synthetic rAF-canvas fixture that freezes on command: HEALTHY while
+    /// animating -> force freeze -> the monitor TRIPS + the pump's current output becomes the fallback (the
+    /// sender NEVER stops — frames keep advancing) -> a single-flight in-process RefreshPage -> the injected
+    /// re-inject marker RE-APPEARS post-refresh (D-17) -> after K-out good frames the monitor returns to
+    /// HEALTHY / source=live (D-15 — recovery is POST-refresh confirmation, not the bare refresh).
+    ///
+    /// <para>D-34 (load-bearing): the smoke uses its OWN DEDICATED recipe constructed INLINE here — NOT the
+    /// production recipe resolver (which could match a real localhost recipe first and apply the wrong
+    /// js/expectMotion, making the freeze-detection assertion measure the wrong page). The inline recipe has
+    /// SMOKE-SCALE tiny thresholds (freezeTimeoutMs/minHoldMs/hysteresis ≪ the D-10 ~10s/~2s production
+    /// defaults) so CI proves the transitions in ~1s, not the production window.</para>
+    ///
+    /// <para>Exit code 1 by default, 0 only on the full path; a hard timeout makes a stuck pipeline fail fast.
+    /// The CI runner is SwiftShader (no GPU) like --inject-smoke; the fixture is a plain 2D canvas (no WebGL).</para>
+    /// </summary>
+    private static void RunMonitorSmoke(string[] args, string launchCachePath)
+    {
+        const int MonitorSmokeTimeoutSeconds = 60;
+        const int Width = 1920;
+        const int Height = 1080;
+        const string NdiName = "XPRESSION-MONITOR-SMOKE";
+
+        // A single loopback origin serving the rAF fixture on every path. A free port keeps the dedicated
+        // recipe's urlMatch (the explicit fixture host:port) un-collidable with any production localhost recipe.
+        var port = GetFreeTcpPort();
+        var origin = $"http://localhost:{port}";
+        var fixtureUrl = $"{origin}/";
+
+        var smokeArg = args.FirstOrDefault(x => x.StartsWith("--monitor-smoke")) ?? "--monitor-smoke";
+        var eq = smokeArg.IndexOf('=');
+        if (eq >= 0 && eq < smokeArg.Length - 1)
+        {
+            fixtureUrl = smokeArg.Substring(eq + 1);
+        }
+
+        Log.Information(
+            "MONITOR-SMOKE starting — fixture={Url} timeout={Timeout}s",
+            fixtureUrl, MonitorSmokeTimeoutSeconds);
+
+        var exitCode = 1; // default failure; only set 0 on the full self-healing path.
+        System.Net.HttpListener? listener = null;
+        FrameMonitor? monitor = null;
+        FramePump? pump = null;
+
+        try
+        {
+            var fixtureDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests-fixtures");
+            var fixturePath = Path.Combine(fixtureDir, "monitor-fixture.html");
+            if (!File.Exists(fixturePath))
+            {
+                Console.WriteLine($"MONITOR-SMOKE FAIL: fixture missing under {fixtureDir}");
+                Log.Error("MONITOR-SMOKE FAIL — fixture missing under {Dir}", fixtureDir);
+                Log.CloseAndFlush();
+                Environment.Exit(1);
+            }
+
+            var fixtureHtml = File.ReadAllText(fixturePath);
+
+            listener = new System.Net.HttpListener();
+            listener.Prefixes.Add($"{origin}/");
+            listener.Start();
+            var listenerCts = new System.Threading.CancellationTokenSource();
+            var listenerThread = new Thread(() => ServeMonitorFixture(listener, listenerCts.Token, fixtureHtml))
+            {
+                IsBackground = true,
+            };
+            listenerThread.Start();
+
+            // D-34: the DEDICATED inline recipe — its urlMatch is the explicit free-port fixture host so the
+            // production resolver is never consulted and cannot shadow it. expectMotion=true so the animating
+            // canvas reads as motion (and a freeze reads as a content-freeze). SMOKE-SCALE tiny thresholds so
+            // the freeze->fallback->recovery transitions fire in a few sample ticks, not the ~10s window. The
+            // js sets the re-inject marker the gate checks RE-APPEARS after the refresh (D-17).
+            var smokeRecipe = new Recipe
+            {
+                UrlMatch = $"localhost:{port}",
+                ExpectMotion = true,
+                FreezeTimeoutMs = 600,   // ≪ the D-10 ~10s production default
+                MinHoldMs = 200,         // ≪ the D-10 ~2s production default
+                HysteresisKIn = 2,       // fail fast
+                HysteresisKOut = 3,      // recover slow-but-quick for CI
+                FallbackPolicy = "slate",
+                Js = "try { window.__xpnMonitorMark = true; } catch (e) {}",
+            };
+
+            launchExpectsCrossOriginIframes = false; // the fixture needs no cross-origin iframe (site-iso ON).
+
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+                AppManagement.LogProvenance();
+
+                // The NDI sender (the pump is the sole sender; a null ptr ⇒ wrong/missing NDI DLL ⇒ fail).
+                var settingsT = new NDIlib.send_create_t { p_ndi_name = UTF.StringToUtf8(NdiName) };
+                Program.NdiSenderPtr = NDIlib.send_create(ref settingsT);
+                if (Program.NdiSenderPtr == nint.Zero)
+                {
+                    Console.WriteLine("MONITOR-SMOKE FAIL: NDIlib.send_create returned nint.Zero (NDI DLL missing/wrong)");
+                    return; // exitCode stays 1
+                }
+
+                browserWrapper = new CefWrapper(Width, Height, fixtureUrl)
+                {
+                    StartupRecipe = smokeRecipe, // doc-start re-inject marker registered BEFORE the first Load.
+                };
+
+                // The REAL single-authority composition root (source -> monitor -> pump -> NDI), the SAME
+                // topology as the interactive path. The refresh delegate is the in-process RefreshPage (D-28),
+                // so the monitor's recovery loop reloads the wedged page exactly as production would.
+                Func<Task> refreshDelegate = () =>
+                {
+                    browserWrapper.RefreshPage();
+                    return Task.CompletedTask;
+                };
+                monitor = new FrameMonitor(browserWrapper, refreshDelegate);
+                pump = new FramePump(monitor, Program.NdiSenderPtr);
+                pump.Start();
+
+                // Generated-default fallback at output geometry (no fallbacks/ dependency for the smoke).
+                var fallbackProvider = new FallbackProvider(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "fallbacks"),
+                    Width, Height, AlphaConvention.Expected);
+                var fallbackResult = fallbackProvider.LoadOrGenerate(smokeRecipe.FallbackPolicy, smokeRecipe.FallbackAsset);
+                monitor.SetFallbackFrame(fallbackResult.Frame.Bgra, fallbackResult.Frame.Width, fallbackResult.Frame.Height);
+
+                monitor.ApplyRecipe(smokeRecipe);
+                monitor.WireHealth(
+                    () => pump.FramesSent,
+                    () => browserWrapper.CurrentRecipe?.UrlMatch,
+                    () => fallbackResult.State,
+                    "ON",
+                    System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime());
+                monitor.StartSampling();
+
+                await browserWrapper.InitializeWrapperAsync();
+
+                var deadline = DateTime.UtcNow.AddSeconds(MonitorSmokeTimeoutSeconds);
+
+                // (1) HEALTHY while the canvas animates + the doc-start marker is present.
+                if (!await PollMainFlagAsync(browserWrapper, "window.__xpnMonitorAnimating === true && window.__xpnMonitorMark === true", deadline))
+                {
+                    Console.WriteLine("MONITOR-SMOKE FAIL: fixture never animated or marker not injected at doc-start");
+                    return;
+                }
+
+                if (!await PollConditionAsync(() => monitor!.Status == MonitorStatus.Healthy && monitor!.OutputState == FrameMonitor.Output.Live, deadline))
+                {
+                    Console.WriteLine($"MONITOR-SMOKE FAIL: not HEALTHY/Live while animating (status={monitor!.Status}, output={monitor!.OutputState})");
+                    return;
+                }
+
+                var framesBeforeFreeze = pump!.FramesSent;
+
+                // (2) Force the freeze -> the monitor TRIPS and the pump output becomes the fallback. The
+                // sender NEVER stops: assert frames keep advancing even though CEF stopped painting (MON-03).
+                await EvalMainAsync(browserWrapper, "window.__xpnMonitorFreeze = true; void 0;");
+
+                if (!await PollConditionAsync(() => monitor!.OutputState == FrameMonitor.Output.Fallback, deadline))
+                {
+                    Console.WriteLine($"MONITOR-SMOKE FAIL: freeze did not flip output to fallback (status={monitor!.Status})");
+                    return;
+                }
+
+                // The pump must have kept sending across the freeze (the sender never stops — MON-03).
+                if (!await PollConditionAsync(() => pump!.FramesSent > framesBeforeFreeze, deadline))
+                {
+                    Console.WriteLine("MONITOR-SMOKE FAIL: pump stopped sending during the freeze (the sender must never stop)");
+                    return;
+                }
+
+                // (3)+(4) The recovery loop issues a single-flight RefreshPage; the reload re-fires the
+                // doc-start script so the re-inject marker RE-APPEARS (D-17), the fresh document drops the
+                // freeze flag and animates again, and after K-out post-refresh good frames the monitor
+                // returns to HEALTHY / source=live (D-15 — recovery is post-refresh confirmation).
+                if (!await PollConditionAsync(() => monitor!.RecoveryAttempts >= 1, deadline))
+                {
+                    Console.WriteLine("MONITOR-SMOKE FAIL: no refresh issued by the recovery loop");
+                    return;
+                }
+
+                if (!await PollMainFlagAsync(browserWrapper, "window.__xpnMonitorMark === true && window.__xpnMonitorAnimating === true", deadline))
+                {
+                    Console.WriteLine("MONITOR-SMOKE FAIL: re-inject marker did not re-appear / fixture did not re-animate after refresh (D-17)");
+                    return;
+                }
+
+                if (!await PollConditionAsync(() => monitor!.Status == MonitorStatus.Healthy && monitor!.OutputState == FrameMonitor.Output.Live, deadline))
+                {
+                    Console.WriteLine($"MONITOR-SMOKE FAIL: did not recover to HEALTHY/Live post-refresh (status={monitor!.Status}, output={monitor!.OutputState})");
+                    return;
+                }
+
+                Log.Information("MONITOR-SMOKE OK — freeze->fallback(sender never stopped)->refresh+re-inject->post-refresh recovery proven.");
+                Console.WriteLine("MONITOR-SMOKE OK");
+                exitCode = 0;
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("MONITOR-SMOKE FAILED — exception: {@ex}", ex);
+            Console.WriteLine($"MONITOR-SMOKE FAIL: exception {ex.Message}");
+            exitCode = 1;
+        }
+        finally
+        {
+            try { if (pump is not null) { pump.StopAsync().GetAwaiter().GetResult(); } } catch { }
+            try { monitor?.Dispose(); } catch { }
+            try { browserWrapper?.Dispose(); } catch { }
+            try { listener?.Stop(); } catch { }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try { Directory.Delete(launchCachePath, true); } catch { }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>Serves the monitor fixture on every path of the loopback origin (torn down on cancel/exit).</summary>
+    private static void ServeMonitorFixture(System.Net.HttpListener listener, System.Threading.CancellationToken token, string fixtureHtml)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            System.Net.HttpListenerContext ctx;
+            try
+            {
+                ctx = listener.GetContext();
+            }
+            catch
+            {
+                break; // listener stopped
+            }
+
+            try
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(fixtureHtml);
+                ctx.Response.ContentType = "text/html; charset=utf-8";
+                ctx.Response.ContentLength64 = bytes.Length;
+                ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+                ctx.Response.OutputStream.Close();
+            }
+            catch
+            {
+                // best-effort per-request; never let one request kill the loopback listener.
+            }
+        }
+    }
+
+    /// <summary>Poll a C# predicate until true or the deadline passes (the monitor-state assertions).</summary>
+    private static async Task<bool> PollConditionAsync(Func<bool> condition, DateTime deadlineUtc)
+    {
+        while (DateTime.UtcNow < deadlineUtc)
+        {
+            try
+            {
+                if (condition())
+                {
+                    return true;
+                }
+            }
+            catch { /* not ready yet — keep polling */ }
+
+            await Task.Delay(100);
+        }
+
+        return false;
     }
 
     /// <summary>Pick a free loopback TCP port (used for the two D-22 cross-origin listener origins).</summary>

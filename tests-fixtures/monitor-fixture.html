@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HtmlToNdi Monitor Fixture</title>
+  <!--
+    D-09/D-34 SYNTHETIC ACCEPTANCE FIXTURE for the --monitor-smoke self-check (Plan 02-06).
+
+    This is the DETERMINISTIC, CI-runnable proof surface for the WHOLE self-healing loop
+    (freeze detection -> fallback on air -> single-flight refresh+re-inject -> post-refresh
+    recovery). It mirrors inject-fixture.html: served over a LOOPBACK HTTP LISTENER inside
+    RunMonitorSmoke (NOT file://) so a dedicated recipe's localhost urlMatch can match.
+
+    SwiftShader-safe: a plain 2D <canvas> animated via requestAnimationFrame — NO WebGL, no GPU
+    needed (the CI runner is GPU-less, like smoke.html / inject-fixture.html). The continuously
+    changing canvas content is what the monitor's content-freeze (dHash) + cadence checks classify
+    as MOTION while animating, and as FROZEN once frozen-on-command.
+
+    FREEZE-ON-COMMAND (D-34): the rAF loop stops drawing when window.__xpnMonitorFreeze === true.
+    RunMonitorSmoke sets that global via Runtime.evaluate; the canvas then stops changing, the
+    page stops painting, and the monitor's freeze/cadence checks trip -> fallback on air.
+
+    RE-INJECT MARKER (D-17 verification): the DEDICATED smoke recipe injects a doc-start script
+    that sets window.__xpnMonitorMark = true. After a forced freeze -> refresh (in-process reload),
+    the doc-start script RE-FIRES on the new document, so the marker MUST re-appear post-refresh.
+    RunMonitorSmoke asserts the marker is present again after the refresh — proving re-inject rode
+    the reload (D-17), not merely that a bare /refresh happened.
+
+    ASSERTION SURFACE (read back / set by RunMonitorSmoke):
+      window.__xpnMonitorAnimating   true once the rAF loop has drawn at least one frame (motion)
+      window.__xpnMonitorFreeze      set TRUE by the gate to freeze the canvas on command
+      window.__xpnMonitorFrameCount  monotonically increasing while animating; STALLS when frozen
+      window.__xpnMonitorMark        set by the recipe's doc-start script (the re-inject marker)
+  -->
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; }
+    /* Full-viewport canvas so the painted frame is clearly non-blank (SwiftShader-safe 2D). */
+    #c { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="320" height="180"></canvas>
+  <script>
+    (function () {
+      var canvas = document.getElementById('c');
+      var ctx = canvas.getContext('2d');
+      var W = canvas.width, H = canvas.height;
+      var t = 0;
+      window.__xpnMonitorFrameCount = 0;
+      window.__xpnMonitorAnimating = false;
+
+      function draw() {
+        // FREEZE-ON-COMMAND (D-34): stop drawing entirely once the gate sets the freeze flag, so the
+        // canvas content stops changing AND the page stops painting (the monitor sees both the
+        // content-freeze and the cadence stall). We do NOT schedule another rAF when frozen.
+        if (window.__xpnMonitorFreeze === true) {
+          return;
+        }
+
+        t += 1;
+        // A high-contrast moving pattern: a sweeping gradient + a moving block. Every frame differs,
+        // so the dHash window never reads "frozen" while animating, and the frame is never blank.
+        var hue = (t * 7) % 360;
+        ctx.fillStyle = 'hsl(' + hue + ', 80%, 45%)';
+        ctx.fillRect(0, 0, W, H);
+        var bx = (t * 5) % (W - 40);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(bx, (H / 2) - 20, 40, 40);
+
+        window.__xpnMonitorFrameCount++;
+        window.__xpnMonitorAnimating = true;
+        requestAnimationFrame(draw);
+      }
+
+      requestAnimationFrame(draw);
+
+      // If the gate UN-freezes (clears the flag) — e.g. the page is reloaded with a fresh document and
+      // the flag is gone — the rAF loop restarts naturally on the new document's first frame. This
+      // file's own globals reset on reload, so a refreshed document animates again from scratch.
+    })();
+  </script>
+</body>
+</html>

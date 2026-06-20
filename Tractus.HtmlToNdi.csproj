@@ -111,4 +111,13 @@
     </None>
   </ItemGroup>
 
+  <!-- D-09/D-34 (MON-02..05): the monitor-smoke self-check serves this committed rAF-canvas fixture over
+       a loopback HTTP listener. It animates continuously (motion) and FREEZES ON COMMAND so the gate can
+       drive freeze -> fallback -> refresh+re-inject -> recovery end to end. Must ship beside the exe. -->
+  <ItemGroup>
+    <None Update="tests-fixtures\monitor-fixture.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
