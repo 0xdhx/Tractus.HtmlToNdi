@@ -120,4 +120,14 @@
     </None>
   </ItemGroup>
 
+  <!-- 03-03 (Q2 / A4): the alpha-0-damage validation fixture for the beacon-damage-check gate. An
+       alpha-0 corner canvas mutating OPAQUE RGB each rAF tick over a static opaque page; the gate captures
+       two non-blank OnPaint buffers a few frames apart and asserts the beacon-region RGB DIFFERS (alpha-0
+       RGB mutation survived damage-gating plus the un-premult LUT). Must ship beside the exe. -->
+  <ItemGroup>
+    <None Update="tests-fixtures\beacon-damage.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

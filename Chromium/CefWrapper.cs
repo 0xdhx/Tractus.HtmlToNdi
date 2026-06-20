@@ -105,7 +105,10 @@ public class CefWrapper : IDisposable, IFrameSource
     private byte[]? capturedBuffer;
     private int capturedWidth;
     private int capturedHeight;
-    private readonly TaskCompletionSource<bool> paintCaptured =
+    // 03-03 (Q2 gate): NOT readonly so the alpha-0-damage gate can RE-ARM for a SECOND capture (a fresh TCS
+    // per arm). The normal --url= send path NEVER re-arms (CaptureNextPaint stays false, L327-328), so the
+    // re-arm is gate-only — the one-shot capturedPaint latch behaviour on the send path is unchanged.
+    private TaskCompletionSource<bool> paintCaptured =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>
@@ -113,6 +116,23 @@ public class CefWrapper : IDisposable, IFrameSource
     /// <see cref="CaptureNextPaint"/>. Only meaningful when the gate armed the latch.
     /// </summary>
     public Task PaintCaptured => this.paintCaptured.Task;
+
+    /// <summary>
+    /// 03-03 (Q2 alpha-0-damage gate ONLY): re-arm the one-shot pre-send capture latch for a SECOND capture.
+    /// Resets <see cref="capturedPaint"/> + clears the prior captured buffer + installs a FRESH
+    /// <see cref="PaintCaptured"/> Task, then re-arms <see cref="CaptureNextPaint"/>. The caller awaits the new
+    /// <see cref="PaintCaptured"/> for the next non-blank paint. This is GATE-ONLY: the normal --url= send path
+    /// never calls it and leaves CaptureNextPaint false, so the send path's one-shot behaviour is unchanged.
+    /// </summary>
+    public void ReArmCapture()
+    {
+        this.capturedPaint = false;
+        this.capturedBuffer = null;
+        this.capturedWidth = 0;
+        this.capturedHeight = 0;
+        this.paintCaptured = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        this.CaptureNextPaint = true;
+    }
 
     /// <summary>
     /// D-29a: the copied pre-send OnPaint bytes (BGRA, <see cref="CapturedWidth"/> *

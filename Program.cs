@@ -90,6 +90,21 @@ public class Program
             return; // unreachable — RunAccuWeatherProbe always calls Environment.Exit.
         }
 
+        if (args.Any(x => x.StartsWith("--beacon-damage-check")))
+        {
+            // 03-03 (Q2 / A4): the alpha-0-damage validation gate — the ONE genuine empirical unknown of
+            // Phase 3 (research §19): does an alpha-0 corner whose OPAQUE RGB mutates each rAF tick produce
+            // CAPTURED OnPaint damage on CefSharp 148, surviving the un-premult LUT into the straight buffer
+            // the FrameMonitor samples? Detected BEFORE --smoke (StartsWith("--smoke") would NOT alias
+            // "--beacon-damage-check") and before the interactive --ndiname/--port prompts (same stdin-hang
+            // hazard). Captures TWO non-blank OnPaint buffers a few frames apart and asserts the beacon-region
+            // RGB DIFFERS. Differs => alpha-0 RGB mutation produces captured damage => the D-13 beacon design
+            // is valid (exit 0). Identical => damage-gating swallowed it => exit non-zero pointing to the A=1
+            // low-alpha fallback. Mirrors RunOnPaintFormatGate; always Environment.Exit.
+            RunBeaconDamageGate(args, launchCachePath);
+            return; // unreachable — RunBeaconDamageGate always calls Environment.Exit.
+        }
+
         if (args.Any(x => x.StartsWith("--smoke")))
         {
             RunSmoke(args, launchCachePath);
@@ -1033,6 +1048,217 @@ public class Program
         {
             Log.Error("ONPAINT-FORMAT FAILED — exception: {@ex}", ex);
             Console.WriteLine($"ONPAINT-FORMAT FAIL: exception {ex.Message}");
+            exitCode = 1;
+        }
+        finally
+        {
+            try { browserWrapper?.Dispose(); } catch { }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try { Directory.Delete(launchCachePath, true); } catch { }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>
+    /// 03-03 (Q2 / A4): the ALPHA-0-DAMAGE validation gate — decides the ONE genuine empirical unknown the
+    /// D-13 liveness-beacon design depends on (research §19): does an alpha-0 corner whose OPAQUE RGB mutates
+    /// each rAF tick produce CAPTURED OnPaint damage on CefSharp 148, surviving the un-premult LUT into the
+    /// STRAIGHT buffer the <see cref="Chromium.Monitor.FrameMonitor"/> beacon sample reads?
+    ///
+    /// <para>Mechanism (mirrors <see cref="RunOnPaintFormatGate"/>): load the alpha-0 beacon fixture on the
+    /// SAME production <see cref="CefWrapper"/> path (transparent BackgroundColor D-29c + the un-premult LUT),
+    /// capture TWO non-blank pre-send OnPaint buffers a few frames apart (re-arming the one-shot capture latch
+    /// via <see cref="CefWrapper.ReArmCapture"/> — GATE-ONLY; the normal --url= send path leaves
+    /// <see cref="CefWrapper.CaptureNextPaint"/> false so its one-shot behaviour is unchanged), and assert the
+    /// BEACON-REGION (top-left corner) RGB DIFFERS between the two. The gate reads the SAME straight buffer the
+    /// capture latch reads (the un-premult LUT output, not the premult source).</para>
+    ///
+    /// <para>DIFFERS → alpha-0 RGB mutation produces captured damage → the beacon design is valid (exit 0).
+    /// IDENTICAL → damage-gating (or the LUT) swallowed the alpha-0 mutation → exit 1 with a message pointing
+    /// to the A4 fallback (a low-alpha A=1 keyed-out beacon, or revisit placement). Always Environment.Exit;
+    /// a hard timeout (the RunSmoke Task.WhenAny pattern) makes a stuck init fail fast.</para>
+    /// </summary>
+    private static void RunBeaconDamageGate(string[] args, string launchCachePath)
+    {
+        const int GateTimeoutSeconds = 25;
+
+        // How many rAF frames to let elapse between the two captures so the beacon's moving bar advances a
+        // visible amount (the bar cycles every ~16 ticks; a short settle is plenty). A Task.Delay between the
+        // first capture and the re-arm.
+        const int InterCaptureDelayMs = 250;
+
+        // The summed |RGB delta| over the sampled beacon pixels above which the two captures count as
+        // DIFFERENT (real captured damage). Identical buffers read 0; a real tick moves R/G/B by tens.
+        const int DiffBound = 6;
+
+        var width = 1920;
+        var height = 1080;
+
+        // --beacon-damage-check or --beacon-damage-check=<url>. Default to the committed alpha-0 beacon
+        // fixture beside the exe, loaded file:// (no recipe/iframe/network — just the known beacon page).
+        var gateArg = args.FirstOrDefault(x => x.StartsWith("--beacon-damage-check")) ?? "--beacon-damage-check";
+        string gateUrl;
+        var eq = gateArg.IndexOf('=');
+        if (eq >= 0 && eq < gateArg.Length - 1)
+        {
+            gateUrl = gateArg.Substring(eq + 1);
+        }
+        else
+        {
+            var localHtml = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests-fixtures", "beacon-damage.html");
+            if (!File.Exists(localHtml))
+            {
+                Console.WriteLine($"BEACON-DAMAGE FAIL: fixture missing at {localHtml}");
+                Log.Error("BEACON-DAMAGE FAIL — fixture missing at {Path}", localHtml);
+                Log.CloseAndFlush();
+                Environment.Exit(1);
+            }
+
+            gateUrl = new Uri(localHtml).AbsoluteUri;
+        }
+
+        // The beacon-region sample coords mirror MonitorDefaults.Beacon* (top-left 16x16). Sample a 4x4 grid
+        // across the canvas extent and sum B+G+R, matching the FrameMonitor beacon sample shape.
+        const int BeaconOriginX = 0;
+        const int BeaconOriginY = 0;
+        const int BeaconSizePx = 16;
+
+        static long SumBeaconRgb(byte[] buffer, int w, int h)
+        {
+            const int Grid = 4;
+            long sum = 0;
+            for (var gy = 0; gy < Grid; gy++)
+            {
+                for (var gx = 0; gx < Grid; gx++)
+                {
+                    var px = BeaconOriginX + (gx * BeaconSizePx) / Grid;
+                    var py = BeaconOriginY + (gy * BeaconSizePx) / Grid;
+                    if (px >= w || py >= h) { continue; }
+                    var off = ((long)py * w + px) * 4;
+                    if (off < 0 || off + 2 >= buffer.Length) { continue; }
+                    sum += buffer[off + 0] + buffer[off + 1] + buffer[off + 2]; // B+G+R
+                }
+            }
+
+            return sum;
+        }
+
+        Log.Information(
+            "BEACON-DAMAGE starting — url={Url} timeout={Timeout}s inter-capture={Delay}ms",
+            gateUrl, GateTimeoutSeconds, InterCaptureDelayMs);
+
+        var exitCode = 1; // default failure; only set 0 when the two captures' beacon RGB DIFFERS.
+
+        try
+        {
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+
+                // D-13 anti-throttle — kept in sync with the smoke/normal/onpaint paths (rAF callbacks alive).
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+                AppManagement.LogProvenance();
+
+                // Production wrapper (transparent BackgroundColor + un-premult LUT); arm the FIRST capture.
+                browserWrapper = new CefWrapper(width, height, gateUrl)
+                {
+                    CaptureNextPaint = true,
+                };
+
+                await browserWrapper.InitializeWrapperAsync();
+
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(GateTimeoutSeconds));
+
+                // ── CAPTURE 1 ──────────────────────────────────────────────────────────────────────────
+                if (await Task.WhenAny(browserWrapper.PaintCaptured, timeoutTask) != browserWrapper.PaintCaptured)
+                {
+                    Console.WriteLine("BEACON-DAMAGE FAIL: no first non-blank OnPaint captured within timeout");
+                    Log.Error("BEACON-DAMAGE FAIL — no first non-blank OnPaint within {Timeout}s.", GateTimeoutSeconds);
+                    return;
+                }
+
+                var buf1 = browserWrapper.CapturedBuffer;
+                var w1 = browserWrapper.CapturedWidth;
+                var h1 = browserWrapper.CapturedHeight;
+                if (buf1 is null || w1 <= 0 || h1 <= 0)
+                {
+                    Console.WriteLine("BEACON-DAMAGE FAIL: first captured buffer null/empty");
+                    Log.Error("BEACON-DAMAGE FAIL — first capture null/empty (w={W} h={H}).", w1, h1);
+                    return;
+                }
+
+                // Let the beacon's moving bar advance, then RE-ARM for the second capture (gate-only).
+                await Task.Delay(InterCaptureDelayMs);
+                browserWrapper.ReArmCapture();
+
+                // ── CAPTURE 2 ──────────────────────────────────────────────────────────────────────────
+                if (await Task.WhenAny(browserWrapper.PaintCaptured, timeoutTask) != browserWrapper.PaintCaptured)
+                {
+                    Console.WriteLine("BEACON-DAMAGE FAIL: no second non-blank OnPaint captured within timeout (alpha-0 mutation may not be generating fresh damage — see A4 fallback)");
+                    Log.Error("BEACON-DAMAGE FAIL — no second non-blank OnPaint within {Timeout}s (possible damage-gating swallow).", GateTimeoutSeconds);
+                    return;
+                }
+
+                var buf2 = browserWrapper.CapturedBuffer;
+                var w2 = browserWrapper.CapturedWidth;
+                var h2 = browserWrapper.CapturedHeight;
+                if (buf2 is null || w2 <= 0 || h2 <= 0)
+                {
+                    Console.WriteLine("BEACON-DAMAGE FAIL: second captured buffer null/empty");
+                    Log.Error("BEACON-DAMAGE FAIL — second capture null/empty (w={W} h={H}).", w2, h2);
+                    return;
+                }
+
+                // ── ASSERT: beacon-region RGB DIFFERS between the two captures ───────────────────────────
+                var sum1 = SumBeaconRgb(buf1, w1, h1);
+                var sum2 = SumBeaconRgb(buf2, w2, h2);
+                var delta = Math.Abs(sum1 - sum2);
+
+                Log.Information(
+                    "BEACON-DAMAGE samples — capture1 beaconRgbSum={Sum1} capture2 beaconRgbSum={Sum2} delta={Delta} (bound={Bound})",
+                    sum1, sum2, delta, DiffBound);
+
+                if (delta >= DiffBound)
+                {
+                    Log.Information(
+                        "BEACON-DAMAGE OK — alpha-0 RGB mutation PRODUCED captured OnPaint damage (delta={Delta} ≥ {Bound}). " +
+                        "A4 HOLDS: the D-13 alpha-0 liveness beacon is valid (its changing pre-key RGB reaches the straight buffer the FrameMonitor samples).",
+                        delta, DiffBound);
+                    Console.WriteLine($"BEACON-DAMAGE OK: alpha-0 RGB mutation produced captured damage (delta={delta})");
+                    exitCode = 0;
+                }
+                else
+                {
+                    Log.Warning(
+                        "BEACON-DAMAGE FAIL — alpha-0 RGB mutation did NOT produce captured OnPaint damage (delta={Delta} < {Bound}). " +
+                        "A4 REFUTED: Chromium damage-gating (or the un-premult LUT's alpha-0 handling) swallowed the alpha-0 mutation. " +
+                        "FALLBACK: use a LOW-ALPHA (A=1) keyed-out beacon (a barely-non-zero alpha forces a real composite while still keying out on air), OR revisit the beacon placement.",
+                        delta, DiffBound);
+                    Console.WriteLine($"BEACON-DAMAGE FAIL: beacon-region RGB identical between captures (delta={delta}) — alpha-0 damage swallowed; use the A=1 low-alpha fallback");
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("BEACON-DAMAGE FAILED — exception: {@ex}", ex);
+            Console.WriteLine($"BEACON-DAMAGE FAIL: exception {ex.Message}");
             exitCode = 1;
         }
         finally

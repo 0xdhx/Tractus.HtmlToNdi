@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Beacon Alpha-0 Damage Gate Fixture (Q2 / A4)</title>
+  <!--
+    03-03 (Q2 / A4) ALPHA-0-DAMAGE VALIDATION FIXTURE for the --beacon-damage-check self-check.
+
+    The ONE genuine empirical unknown of Phase 3 (research §19): does an alpha-0 corner whose OPAQUE RGB
+    mutates every rAF tick produce CAPTURED OnPaint damage on CefSharp 148 — surviving the un-premult LUT
+    into the straight buffer the FrameMonitor samples? If yes, the D-13 alpha-0 liveness beacon design is
+    valid (the beacon is invisible on air after the straight-alpha key, yet the monitor reads its changing
+    pre-key RGB). If no (damage-gating swallows the alpha-0 mutation, or the LUT zeroes it), the fallback is
+    a low-alpha A=1 keyed-out beacon — the gate FAILS LOUDLY pointing there.
+
+    LAYOUT (mirrors the production InjectHook beacon by VALUE — keep in sync):
+      - A 16x16 canvas pinned TOP-LEFT (0,0) with a TRANSPARENT (alpha-0) background but OPAQUE-RGB content
+        drawn each rAF tick (a moving bar whose R/G/B cycle). This is the beacon region the gate samples in
+        BOTH captures and asserts the RGB DIFFERS between them.
+      - A static OPAQUE content block filling the rest of the viewport so each captured frame is NON-BLANK
+        (the one-shot pre-send capture skips blank frames). The static block does NOT change, isolating the
+        beacon corner as the only mutating region.
+
+    The canvas occupies REAL captured pixels: fixed top-left, NOT display:none / visibility:hidden /
+    0-size / off-screen (all cull the paint, research §18). The gate runs on the production CefWrapper path
+    with a transparent BackgroundColor (D-29c) + the un-premult LUT, so the corner reads back as STRAIGHT
+    pre-key bytes — exactly what the FrameMonitor beacon sample reads.
+  -->
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }
+    /* Static OPAQUE content so every captured frame is non-blank; does NOT change (isolates the beacon). */
+    #content {
+      position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+      background-color: rgba(0, 128, 0, 1); /* opaque green — keeps the frame non-blank, never mutates */
+      z-index: 0;
+    }
+    /* The alpha-0 beacon canvas, top-left corner, real captured pixels. */
+    #beacon {
+      position: fixed; left: 0; top: 0; width: 16px; height: 16px;
+      margin: 0; padding: 0; pointer-events: none; background: transparent;
+      z-index: 2147483647;
+    }
+  </style>
+</head>
+<body>
+  <div id="content"></div>
+  <canvas id="beacon" width="16" height="16"></canvas>
+  <script>
+    // The alpha-0 beacon: clear to transparent each tick, then draw an OPAQUE moving bar whose RGB cycles.
+    // Mirrors InjectHook.BuildPayload's __xpnBeaconDraw exactly (the production beacon shape).
+    (function () {
+      var c = document.getElementById('beacon');
+      var ctx = c.getContext('2d');
+      var tick = 0;
+      function draw() {
+        tick = (tick + 1) & 0xff;
+        ctx.clearRect(0, 0, 16, 16);
+        var r = (tick * 7) & 0xff;
+        var g = (tick * 13) & 0xff;
+        var b = (tick * 29) & 0xff;
+        ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',1)';
+        var x = tick % 16;
+        ctx.fillRect(0, 0, x + 1, 16);
+        window.requestAnimationFrame(draw);
+      }
+      window.requestAnimationFrame(draw);
+    })();
+  </script>
+</body>
+</html>

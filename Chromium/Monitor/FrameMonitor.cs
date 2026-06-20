@@ -661,14 +661,21 @@ public sealed class FrameMonitor : IDisposable
             return (true, "beacon-frozen");
         }
 
-        // (2) FREEZE — content-delta freeze BACKSTOP, GATED by expectMotion (D-11: a static page must never
-        // trip). Retained as the backstop behind the beacon (and the ONLY freeze trip when the beacon is
-        // absent). Reuses the dHash already computed above for the seam — push it into the freeze ring here.
+        // 03-03 (D-13) IDLE-HOLD: a TICKING beacon is positive proof the render/capture pipeline is alive,
+        // so a static whole-frame dHash is a legitimate idle-hold (the radar's self-throttled gap between
+        // loop iterations), NOT a freeze — STAY ON AIR. This is the VAL-04 crux: a self-throttling isolated
+        // radar's long idle-hold and a genuine freeze are pixel-identical to a whole-frame dHash, so the
+        // beacon (which WE control) disambiguates them. When the beacon is ticking we therefore SUPPRESS the
+        // dHash freeze backstop (but keep the ring fed so it is warm if the beacon later goes absent). The
+        // dHash + paint-age backstop below is the ONLY freeze trip path when the beacon is ABSENT (D-13).
         if (snapshot is not null && this.expectMotion)
         {
             this.PushHash(this.lastSampleDHash);
-            if (this.HashWindowFrozen())
+            if (this.beaconState != BeaconLiveness.True && this.HashWindowFrozen())
             {
+                // Beacon ABSENT (or not yet established) AND the whole-frame dHash window is frozen → the
+                // backstop trips. A TICKING beacon short-circuits this (idle-hold). A FROZEN beacon already
+                // returned "beacon-frozen" above (the faster signal).
                 return (true, "freeze-dhash");
             }
         }
