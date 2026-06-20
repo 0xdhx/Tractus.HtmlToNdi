@@ -267,7 +267,12 @@ public sealed class FallbackProvider
 /// D-20c: whether the fallback frame is the operator-CONFIGURED asset or the in-memory
 /// GENERATED-DEFAULT substitution. Plan 06's <c>/health</c> reports this read-only (threat T-2-04-4 —
 /// no path, no secret).
+/// <para>RC-2 (02-07 / D-32): serialize as a kebab-lower STRING token (<c>configured</c> /
+/// <c>generated-default</c>), never the System.Text.Json numeric default — completing the 3-of-3
+/// <c>/health</c> string-enums (MonitorStatus + FrameSource already carry this converter). A watchdog
+/// reads the string, not the integer 1 the live 02-UAT.md capture leaked.</para>
 /// </summary>
+[System.Text.Json.Serialization.JsonConverter(typeof(KebabCaseStringEnumConverter))]
 public enum FallbackAssetState
 {
     /// <summary>The configured asset loaded + validated cleanly.</summary>
