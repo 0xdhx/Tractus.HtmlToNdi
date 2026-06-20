@@ -218,6 +218,19 @@ public sealed class InjectHook : IDisposable
     /// — NEVER coordinate-clicking (INJ-05 anti-feature boundary). This hook exposes no mouse/coordinate
     /// API.</para>
     /// </summary>
+    /// <summary>
+    /// D-13/D-24 BEACON GEOMETRY (the contract between the injected canvas here and the FrameMonitor
+    /// beacon-region pre-key RGB sample). The beacon is a small FIXED-position canvas pinned to the
+    /// TOP-LEFT corner at (0,0); the monitor samples pixel <c>(BeaconSampleX, BeaconSampleY)</c> — the
+    /// CENTER of the canvas — off the copied straight front buffer. These constants are duplicated (by
+    /// value, not by reference — FrameMonitor is CEF-agnostic and must not import this Inject type, D-02)
+    /// in <c>MonitorDefaults.BeaconSampleX/Y</c>; keep them in sync. Corner (0,0): the canvas occupies real
+    /// captured pixels (NOT display:none / visibility:hidden / 0-size / off-screen — all cull the paint,
+    /// research §"Visibility gotchas"); its background is alpha-0 (keyed out on air) but it draws OPAQUE-RGB
+    /// content that MUTATES every rAF tick so Chromium damage-gating cannot optimize it away (research §16).
+    /// </summary>
+    private const int BeaconSizePx = 16;
+
     private static string BuildPayload(Recipe recipe)
     {
         // JSON-encode the CSS and JS so arbitrary recipe content embeds safely inside the JS literal
@@ -228,8 +241,86 @@ public sealed class InjectHook : IDisposable
         // (it throws at apply()-time, caught + logged, instead of voiding the whole document-start script).
         var jsLiteral = JsonSerializer.Serialize(recipe.Js ?? string.Empty);
 
+        // D-18/D-03: the target selector the __xpnTargetPresent stanza resolves to prove the target is
+        // present + isolated (full-bleed). JSON-encoded as DATA (queried via document.querySelector, never
+        // interpolated as code). Empty when the recipe declares no targetSelector → targetPresent stays
+        // false (the proof marker correctly reports "no target to isolate").
+        var targetSelectorLiteral = JsonSerializer.Serialize(recipe.TargetSelector ?? string.Empty);
+
         // The debounce interval (ms) for the MutationObserver re-assert (D-02 — guards 60fps storms).
         const int DebounceMs = 50;
+
+        // D-15: the BEACON stanza is composed into the payload ONLY when recipe.ExpectMotion is true — a
+        // SERVER-SIDE C# branch (NOT a JS runtime check), so a static page's payload carries no beacon at
+        // all (monitor infrastructure, not per-recipe boilerplate). The canvas mutates OPAQUE-RGB pixels in
+        // the alpha-0 corner each rAF tick (D-13); the rAF loop is guarded by the distinct global
+        // window.__xpnBeaconArmed (the __xpnInjected idempotency pattern, L240-242) so the observer
+        // re-running apply() never starts a SECOND loop. NO mouse/coordinate-click primitive (D-17).
+        var beaconStanza = recipe.ExpectMotion
+            ? $$"""
+                // D-13 LIVENESS BEACON (expectMotion=true ONLY — composed server-side). A {{BeaconSizePx}}x{{BeaconSizePx}}
+                // fixed canvas at the top-left corner: alpha-0 background (keyed out on air; sampled PRE-key by
+                // the FrameMonitor) but OPAQUE-RGB content that MUTATES every rAF tick so Chromium damage-gating
+                // cannot optimize the pixels away (research §16). Guarded by __xpnBeaconArmed so the observer's
+                // apply() re-fire never double-arms the rAF loop (idempotency Test 1).
+                function __xpnArmBeacon() {
+                    if (window.__xpnBeaconArmed) { return; }
+                    try {
+                        var c = document.getElementById('__xpn_beacon');
+                        if (!c) {
+                            c = document.createElement('canvas');
+                            c.id = '__xpn_beacon';
+                            c.width = {{BeaconSizePx}};
+                            c.height = {{BeaconSizePx}};
+                            var s = c.style;
+                            // Real captured pixels: fixed top-left, NOT display:none/visibility:hidden/0-size/
+                            // off-screen (all cull the paint). z-index keeps it in the composited layer.
+                            s.setProperty('position', 'fixed', 'important');
+                            s.setProperty('left', '0', 'important');
+                            s.setProperty('top', '0', 'important');
+                            s.setProperty('width', '{{BeaconSizePx}}px', 'important');
+                            s.setProperty('height', '{{BeaconSizePx}}px', 'important');
+                            s.setProperty('margin', '0', 'important');
+                            s.setProperty('padding', '0', 'important');
+                            s.setProperty('pointer-events', 'none', 'important');
+                            s.setProperty('z-index', '2147483647', 'important');
+                            // Background stays alpha-0 (transparent) — keyed out on air; the FILL below draws
+                            // OPAQUE RGB so the pre-key buffer carries the changing color the monitor samples.
+                            s.setProperty('background', 'transparent', 'important');
+                            (document.body || document.documentElement).appendChild(c);
+                        }
+                        var ctx = c.getContext('2d');
+                        if (!ctx) { return; }
+                        window.__xpnBeaconArmed = true;
+                        var __xpnBeaconTick = 0;
+                        function __xpnBeaconDraw() {
+                            try {
+                                __xpnBeaconTick = (__xpnBeaconTick + 1) & 0xff;
+                                // Clear to alpha-0 (transparent) every tick, then draw an OPAQUE moving bar
+                                // whose RGB changes each tick — guarantees real pixel damage (NOT a static or
+                                // identically-re-rendering counter, research §16). The bar's hue + x cycle.
+                                ctx.clearRect(0, 0, {{BeaconSizePx}}, {{BeaconSizePx}});
+                                var r = (__xpnBeaconTick * 7) & 0xff;
+                                var g = (__xpnBeaconTick * 13) & 0xff;
+                                var b = (__xpnBeaconTick * 29) & 0xff;
+                                ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',1)';
+                                var x = __xpnBeaconTick % {{BeaconSizePx}};
+                                ctx.fillRect(0, 0, x + 1, {{BeaconSizePx}});
+                            } catch (e) {}
+                            window.requestAnimationFrame(__xpnBeaconDraw);
+                        }
+                        window.requestAnimationFrame(__xpnBeaconDraw);
+                    } catch (e) {}
+                }
+
+        """
+            : "// (beacon stanza omitted — recipe.ExpectMotion=false, D-15)";
+
+        // D-15: the beacon arm CALL — also gated server-side so a non-motion payload never references the
+        // function. Placed inside apply() after the user fn so it re-arms (idempotently) under the observer.
+        var beaconApplyCall = recipe.ExpectMotion
+            ? "__xpnArmBeacon();"
+            : "/* no beacon (expectMotion=false, D-15) */";
 
         return $$"""
         (function () {
@@ -243,6 +334,11 @@ public sealed class InjectHook : IDisposable
 
             var __xpnCss = {{cssLiteral}};
             var __xpnJsSrc = {{jsLiteral}};
+            // D-03/D-18: the recipe's target selector (DATA, queried — never interpolated as code). Empty
+            // string ⇒ no target declared ⇒ __xpnTargetPresent stays false.
+            var __xpnTargetSelector = {{targetSelectorLiteral}};
+
+            {{beaconStanza}}
 
             // Belt-and-suspenders <style> shim (NOT the load-bearing path — spike (b2)). Appended from
             // JS because there is no CDP inject-CSS-at-document-start verb.
@@ -264,9 +360,32 @@ public sealed class InjectHook : IDisposable
             var __xpnUserFn = null;
             try { __xpnUserFn = new Function(__xpnJsSrc); } catch (e) { __xpnUserFn = null; }
 
+            // D-03 TARGET-PRESENT PROOF MARKER (re-evaluated EACH apply() — NOT behind the one-time guard;
+            // it is a per-tick re-evaluation, Test 3). Sets window.__xpnTargetPresent true when the recipe's
+            // target selector resolves AND the element is isolated/full-bleed (non-zero rendered box). This is
+            // observability ONLY (D-14): it is surfaced on /health but NEVER wired into UseFallback (it strobes
+            // on SPA re-render). The flag is READ by the SIBLING CDP probe composed at /health (Program.cs,
+            // Task 2 Part D) — NOT by FrameMonitor (which stays IFrameSource-only, D-24). NO coordinate API.
+            function __xpnEvalTargetPresent() {
+                try {
+                    if (!__xpnTargetSelector) { window.__xpnTargetPresent = false; return; }
+                    var t = document.querySelector(__xpnTargetSelector);
+                    if (!t) { window.__xpnTargetPresent = false; return; }
+                    // "isolated" = the target has a real rendered box (it was found AND laid out). A
+                    // getBoundingClientRect with non-zero area is the cheap, layout-shift-robust proof.
+                    var rect = t.getBoundingClientRect();
+                    window.__xpnTargetPresent = !!(rect && rect.width > 0 && rect.height > 0);
+                } catch (e) { window.__xpnTargetPresent = false; }
+            }
+
             function apply() {
                 __xpnApplyCss();
                 if (__xpnUserFn) { try { __xpnUserFn(); } catch (e) {} }
+                // D-03: re-evaluate the target-present proof marker every apply() (per-tick, NOT guarded).
+                __xpnEvalTargetPresent();
+                // D-13/D-15: (re-)arm the liveness beacon — idempotent via __xpnBeaconArmed (no-op on the
+                // expectMotion=false payload, where the call expands to a comment).
+                {{beaconApplyCall}}
             }
 
             // DEBOUNCED MutationObserver (D-02 / INJ-03) — re-assert on SPA re-render / consent re-mount.
