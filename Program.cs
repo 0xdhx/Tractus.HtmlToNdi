@@ -960,7 +960,18 @@ public class Program
             Environment.Exit(1);
         }
 
-        var startUrl = recipe!.UrlMatch ?? "https://www.accuweather.com/";
+        // --url=<operator radar URL> override (REQUIRED in practice). recipe.UrlMatch is a GLOB
+        // (".../weather-radar/*") — NOT navigable; without this the gate loads the literal glob and never
+        // reaches a real radar page (the cause of the 03-03 "static dHash + targetPresent=false" capture).
+        string? urlOverride = null;
+        var urlArg = args.FirstOrDefault(x => x.StartsWith("--url="));
+        if (urlArg is not null && urlArg.Length > "--url=".Length)
+        {
+            urlOverride = urlArg.Substring("--url=".Length);
+        }
+        var startUrl = !string.IsNullOrWhiteSpace(urlOverride)
+            ? urlOverride!
+            : (recipe!.UrlMatch ?? "https://www.accuweather.com/");
         Log.Information(
             "ACCUWEATHER-CAPTURE starting — recipe={Recipe} expectMotion={Motion} duration={Duration}s out={Out}",
             recipePath, recipe.ExpectMotion, durationSeconds, outPath);
