@@ -326,9 +326,13 @@ public class CefWrapper : IDisposable, IFrameSource
     }
 
     /// <summary>
-    /// D-15c: cheap non-blank check over the BGRA paint buffer — true if the sampled pixels are
-    /// effectively all-black (so a never-painting SwiftShader init does not count as a good frame).
-    /// Samples a sparse stride to stay O(1)-ish on a 1080p buffer.
+    /// D-15c / D-08: cheap blank-frame check over the BGRA paint buffer. Originally a luma-only all-black
+    /// test (so a never-painting SwiftShader init does not count as a good frame); Plan 02-03 EXTENDED it
+    /// with the two D-08 branches via <see cref="BlankDetector"/> — a low-variance/abnormal branch AND an
+    /// all-alpha-0 (straight-alpha transparent-blank) branch the luma-only check missed. The original
+    /// broadcast-black classification is PRESERVED (the explicit all-black scan below) and is ORed with the
+    /// new branches, so the existing <see cref="OnBrowserPaint"/> smoke/capture call-sites do not regress —
+    /// a genuinely all-black frame still returns true. Samples a sparse stride to stay O(1)-ish on 1080p.
     /// </summary>
     private static unsafe bool IsBlankBuffer(nint buffer, int width, int height)
     {
@@ -359,8 +363,18 @@ public class CefWrapper : IDisposable, IFrameSource
             }
         }
 
-        // Require a meaningful fraction of sampled pixels to be non-black.
-        return nonBlack < 16;
+        // PRESERVED original all-black classification: a meaningful fraction must be non-black.
+        if (nonBlack < 16)
+        {
+            return true;
+        }
+
+        // D-08 EXTENSION: even a non-black frame is blank/abnormal if it is near-uniform (low-variance,
+        // abnormal folded in) or fully transparent (all-alpha-0). Delegate to the pure detector over a
+        // span view of the contiguous BGRA buffer (stride == width*4 for the CEF OnPaint surface).
+        long byteCount = totalPixels * bytesPerPixel;
+        var span = new ReadOnlySpan<byte>((void*)buffer, checked((int)byteCount));
+        return Monitor.BlankDetector.Analyze(span, width, height, width * bytesPerPixel).IsBlank;
     }
 
     protected virtual void Dispose(bool disposing)
