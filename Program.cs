@@ -319,12 +319,20 @@ public class Program
 
         Program.NdiSenderPtr = NDIlib.send_create(ref settings_T);
 
-        // D-01/D-26: construct the extracted NDI sink with the ctor-injected sender ptr and subscribe
-        // it to the CefWrapper IFrameSource. OnBrowserPaint early-returns while NdiSenderPtr == Zero,
-        // and the watchdog re-invalidates paint every second, so subscribing here (right after the
-        // sender exists) catches every subsequent frame — identical timing to the upstream send.
-        var ndiSink = new NdiFrameSink(Program.NdiSenderPtr);
-        ndiSink.AttachTo(browserWrapper);
+        // D-01/D-03/D-27/D-30/D-31 — THE COMPOSITION ROOT (this plan, 02-02, is the SINGLE owner of the
+        // Program.cs composition edits; 02-04's --fallback-dir edit serializes after via depends_on, D-35).
+        // The OLD push wiring (the NdiFrameSink subscribing to FrameReady and sending in-call) is
+        // REPLACED by the single-authority pump topology: source → monitor → pump → NDI.
+        //   - FrameMonitor SUBSCRIBES to browserWrapper.FrameReady (the IFrameSource), copies each
+        //     callback-scoped frame into a wait-free pinned double-buffer, and owns the current-output slot.
+        //   - FramePump is the SOLE send_send_video_v2 caller; it PULLS monitor.SnapshotCurrentOutput()
+        //     on a non-reentrant PeriodicTimer so NDI never stops even during a no-paint freeze (MON-03).
+        // The `monitor` LOCAL declared here is exactly what Plan 06's /health closes over
+        // (() => monitor.SnapshotHealth()) and what Plan 05 reaches for Reset() — there is deliberately
+        // NO CefWrapper.Monitor / browserWrapper.Monitor accessor property (D-27).
+        var monitor = new FrameMonitor(browserWrapper);
+        var pump = new FramePump(monitor, Program.NdiSenderPtr);
+        pump.Start();
 
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
@@ -597,10 +605,17 @@ public class Program
                     return; // exitCode stays 1
                 }
 
-                // D-01/D-26: construct the extracted NDI sink with the ctor-injected sender ptr and
-                // subscribe it to the CefWrapper IFrameSource BEFORE InitializeWrapperAsync wires Paint.
-                var ndiSink = new NdiFrameSink(Program.NdiSenderPtr);
-                ndiSink.AttachTo(browserWrapper);
+                // D-01/D-27/D-30/D-31 — the SAME single-authority composition root as the interactive
+                // path, re-proving --smoke under the pump rewrite (D-01 / CONTEXT calibration constraint 5).
+                // FrameMonitor subscribes to browserWrapper.FrameReady BEFORE InitializeWrapperAsync wires
+                // Paint, so the first paint is copied; FramePump pulls + sends on cadence. The wrapper's
+                // one-shot SmokeMode latch still gates "one non-blank frame painted" (it fires inside
+                // OnBrowserPaint after FrameReady?.Invoke, regardless of the subscriber), so the smoke
+                // success signal (SmokeFrameSent) is unchanged — but the actual NDI send now flows
+                // source → monitor → pump, re-proving the keyable BGRA hot path end-to-end.
+                var monitor = new FrameMonitor(browserWrapper);
+                var pump = new FramePump(monitor, Program.NdiSenderPtr);
+                pump.Start();
 
                 await browserWrapper.InitializeWrapperAsync();
 
@@ -618,6 +633,10 @@ public class Program
                 Log.Information("SMOKE OK — one non-blank BGRA frame sent through the vendored NDI DLL.");
                 Console.WriteLine("SMOKE OK");
                 exitCode = 0;
+
+                // Clean teardown of the single-authority pump before the wrapper is disposed in finally.
+                await pump.StopAsync();
+                monitor.Dispose();
             });
         }
         catch (Exception ex)

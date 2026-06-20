@@ -3,10 +3,14 @@ using NewTek;
 namespace Tractus.HtmlToNdi.Chromium;
 
 /// <summary>
-/// The extracted NDI send (D-01). SUBSCRIBES to an <see cref="IFrameSource"/>'s
-/// <see cref="IFrameSource.FrameReady"/> event and owns <c>NDIlib.send_send_video_v2</c>. The NDI
-/// sender pointer is injected via the CONSTRUCTOR (D-26 — <c>new NdiFrameSink(senderPtr)</c>), NOT
-/// read from the composition-root global, so the sink is injectable and unit-testable.
+/// SUPERSEDED by the single-authority pump (Plan 02-02 / D-01/D-03). This PUSH sink (it auto-sent
+/// in-call from <see cref="IFrameSource.FrameReady"/>) is NO LONGER WIRED into the composition root:
+/// <see cref="FramePump"/> is now the SOLE <c>NDIlib.send_send_video_v2</c> caller, PULLING the
+/// monitor's current-output buffer on a steady cadence so NDI never stops during a no-paint freeze
+/// (MON-03). This class is retained as the canonical reference for the BGRA <c>video_frame_v2_t</c>
+/// build the pump mirrors byte-identically (<see cref="OnFrame"/>); it is intentionally DEAD CODE in
+/// the live pipeline — do NOT re-attach it (double-send + loss of freeze-survival, the listed
+/// anti-pattern). Originally: the extracted NDI send (D-01), sender ptr ctor-injected (D-26).
 /// </summary>
 /// <remarks>
 /// D-01 SEAM CONTRACT — the frame buffer is CALLBACK-SCOPED. This sink sends IN-CALL (as the
