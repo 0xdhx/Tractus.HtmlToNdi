@@ -646,17 +646,24 @@ public sealed class FrameMonitor : IDisposable
         this.Transition(MonitorStatus.Recovering,
             $"refresh#{this.recoveryAttempts} issued (single-flight, post-refresh K-out gate armed)");
 
-        // Fire the injected delegate. We do NOT await inside the lock; the latch clears on completion.
+        // Fire the injected delegate. We do NOT await inside the lock; the latch clears on completion so a
+        // long-running reload cannot be double-issued (single-flight, D-13). The COOLDOWN is the spacing
+        // gate between successive attempts; the in-flight latch only guards against re-issuing WHILE the
+        // SAME reload await is still outstanding.
         var task = this.refreshDelegate();
-        if (task is null)
+        if (task is null || task.IsCompleted)
         {
-            this.refreshInFlight = false;
-            return;
+            // Synchronously-completed (or null) refresh → clear the latch inline; cooldown now spaces the
+            // next attempt. (Without this, a delegate that returns Task.CompletedTask would leave the latch
+            // set until an async continuation ran, wedging escalation on a single-threaded driver.)
+            Volatile.Write(ref this.refreshInFlight, false);
         }
-
-        task.ContinueWith(
-            _ => Volatile.Write(ref this.refreshInFlight, false),
-            TaskScheduler.Default);
+        else
+        {
+            task.ContinueWith(
+                _ => Volatile.Write(ref this.refreshInFlight, false),
+                TaskScheduler.Default);
+        }
     }
 
     private void EnterFallback(DateTime now, string reason)
@@ -681,6 +688,48 @@ public sealed class FrameMonitor : IDisposable
     private bool MinHoldElapsed(DateTime now)
         => this.fallbackEnteredTs == DateTime.MinValue
            || (now - this.fallbackEnteredTs).TotalMilliseconds >= this.minHoldMs;
+
+    /// <summary>
+    /// D-26 / Pitfall P-5: clear ALL stale detection + recovery state so a swapped page is classified
+    /// FRESH — clears the dHash freeze ring + the hysteresis run counters + <see cref="recoveryAttempts"/>
+    /// + <see cref="lastRefreshTs"/> + <see cref="fallbackReason"/> + the transition state, returns the
+    /// state machine to <see cref="MonitorStatus.Healthy"/>, flips output back to Live, and applies the
+    /// NEW recipe's timing/<c>expectMotion</c> (via <see cref="ApplyRecipe"/>). Called from the composition
+    /// root's swap handler on EVERY successful <c>SetUrlAsync</c>/<c>SwapRecipeAsync</c> (the swap signal
+    /// is an injected callback — this monitor is NEVER referenced by the frame-source wrapper, D-28).
+    ///
+    /// <para>This is a STATE CLEAR, NOT a teardown: it does NOT unsubscribe <c>FrameReady</c> or free the
+    /// buffers (those survive a swap; only <see cref="Dispose"/> tears them down). RELOADING the fallback
+    /// asset for the new recipe's policy is the composition root's responsibility — it re-runs the
+    /// <c>FallbackProvider</c> and calls <see cref="SetFallbackFrame"/> right after this, keeping the
+    /// monitor free of any provider/CEF type (D-28).</para>
+    /// </summary>
+    /// <param name="newRecipe">The recipe swapped in (its timing/expectMotion are applied; null ⇒ defaults).</param>
+    public void Reset(Recipe? newRecipe)
+    {
+        lock (this.stateLock)
+        {
+            this.ClearHashWindow();
+            this.badRun = 0;
+            this.goodRun = 0;
+            this.recoveryAttempts = 0;
+            this.lastRefreshTs = DateTime.MinValue;
+            this.fallbackEnteredTs = DateTime.MinValue;
+            this.fallbackReason = string.Empty;
+            Volatile.Write(ref this.refreshInFlight, false);
+            this.UseFallback(false); // back to Live — the new page is presumed good until proven bad.
+
+            // Apply the new recipe's timing/expectMotion INSIDE the same lock as the state clear so a
+            // concurrent sample tick can never observe a half-reset (new windows, old expectMotion).
+            this.freezeTimeoutMs = newRecipe?.FreezeTimeoutMs ?? Recipe.DefaultFreezeTimeoutMs;
+            this.minHoldMs = newRecipe?.MinHoldMs ?? Recipe.DefaultMinHoldMs;
+            this.hysteresisKIn = newRecipe?.HysteresisKIn ?? Recipe.DefaultHysteresisKIn;
+            this.hysteresisKOut = newRecipe?.HysteresisKOut ?? Recipe.DefaultHysteresisKOut;
+            this.expectMotion = newRecipe?.ExpectMotion ?? false;
+
+            this.Transition(MonitorStatus.Healthy, "reset:swap (windows+counters cleared, new recipe applied)");
+        }
+    }
 
     // Record a state change with its triggering reason (Pitfall P-4). MUST be called under stateLock.
     private void Transition(MonitorStatus next, string reason)

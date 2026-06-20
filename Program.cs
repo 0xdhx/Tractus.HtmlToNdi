@@ -352,7 +352,16 @@ public class Program
         // The `monitor` LOCAL declared here is exactly what Plan 06's /health closes over
         // (() => monitor.SnapshotHealth()) and what Plan 05 reaches for Reset() — there is deliberately
         // NO CefWrapper.Monitor / browserWrapper.Monitor accessor property (D-27).
-        var monitor = new FrameMonitor(browserWrapper);
+        // 02-05 (D-28/D-13): inject the IN-PROCESS refresh delegate so the monitor's recovery state machine
+        // can self-heal a wedged page WITHOUT a CEF type leaking into FrameMonitor. The monitor calls THIS
+        // delegate single-flight on TRIPPED; Phase 5 would inject () => page.ReloadAsync() instead and reuse
+        // the whole monitor unchanged. RefreshPage() is void → wrap it as a completed Task.
+        Func<Task> refreshDelegate = () =>
+        {
+            browserWrapper.RefreshPage();
+            return Task.CompletedTask;
+        };
+        var monitor = new FrameMonitor(browserWrapper, refreshDelegate);
         var pump = new FramePump(monitor, Program.NdiSenderPtr);
         pump.Start();
 
@@ -374,6 +383,27 @@ public class Program
             fallbackResult.Sought,
             fallbackAssetState == FallbackAssetState.Configured ? "configured" : "generated-default",
             width, height);
+
+        // 02-05 (D-26/D-28): apply the startup recipe's timing/expectMotion to the state machine, then wire
+        // the swap-reset. On EVERY successful SetUrlAsync/SwapRecipeAsync the wrapper raises RecipeSwapped;
+        // the composition root (NOT CefWrapper — it holds no FrameMonitor reference) resets the monitor's
+        // stale detection/recovery state AND reloads the fallback asset for the new recipe's policy, so the
+        // swapped page is classified fresh and false-trips on neither the old dHash window nor the old
+        // fallback (Pitfall P-5). Then start the non-reentrant 5Hz sampler (D-06/D-31).
+        monitor.ApplyRecipe(startupRecipe);
+        browserWrapper.RecipeSwapped += swapped =>
+        {
+            monitor.Reset(swapped);
+            var swappedFallback = fallbackProvider.LoadOrGenerate(swapped?.FallbackPolicy, swapped?.FallbackAsset);
+            monitor.SetFallbackFrame(
+                swappedFallback.Frame.Bgra, swappedFallback.Frame.Width, swappedFallback.Frame.Height);
+            fallbackAssetState = swappedFallback.State;
+            Log.Information(
+                "MONITOR reset on swap — recipe expectMotion={Motion} fallback={State}",
+                swapped?.ExpectMotion ?? false,
+                swappedFallback.State == FallbackAssetState.Configured ? "configured" : "generated-default");
+        };
+        monitor.StartSampling();
 
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
@@ -551,6 +581,12 @@ public class Program
 
         running = false;
         thread.Join();
+
+        // 02-05 (D-26): clean shutdown — stop the pump + the monitor's 5Hz sampler (Dispose stops the timer
+        // first, then unsubscribes FrameReady) BEFORE the wrapper is disposed, so no sampler tick or send
+        // fires against a torn-down browser. Mirrors the --smoke teardown.
+        pump.StopAsync().GetAwaiter().GetResult();
+        monitor.Dispose();
         browserWrapper.Dispose();
 
         if (Directory.Exists(launchCachePath))

@@ -66,6 +66,16 @@ public class CefWrapper : IDisposable, IFrameSource
     /// </summary>
     public event Action<FrameView>? FrameReady;
 
+    /// <summary>
+    /// D-26/D-28: raised after EVERY successful navigation/swap (both <see cref="SwapRecipeAsync"/> and the
+    /// same-recipe <see cref="SetUrlAsync"/> branch) carrying the NOW-current recipe. The composition root
+    /// subscribes this to invoke <c>FrameMonitor.Reset(recipe)</c> + reload the fallback asset, so a
+    /// /seturl or /recipe swap clears stale monitor state (Pitfall P-5 — without it the new page false-trips
+    /// on the old page's dHash window). This wrapper holds NO FrameMonitor reference (D-28): the reset is a
+    /// CALLBACK from here, NOT a direct FrameMonitor.Reset() call inside CefWrapper.
+    /// </summary>
+    public event Action<Recipe?>? RecipeSwapped;
+
     // D-15b: conditional one-shot smoke seam. OnBrowserPaint is private and the upstream send
     // is continuous (gated only on Program.NdiSenderPtr != Zero), so "exactly one send" cannot
     // be hooked from Program — the latch must live here. It is ARMED only under --smoke; on the
@@ -438,6 +448,12 @@ public class CefWrapper : IDisposable, IFrameSource
         // Same recipe → the registered doc-start script re-fires on the new document; just navigate.
         this.Url = url;
         this.browser.Load(url);
+
+        // D-26: a same-recipe URL change is STILL a swap for the monitor — the new page must be classified
+        // fresh (its dHash window / freeze/recovery counters reset). Raise the swap signal the composition
+        // root subscribes to invoke FrameMonitor.Reset() (Pitfall P-5). Reset fires on EVERY successful
+        // SetUrlAsync, not only the recipe-swap branch.
+        this.RecipeSwapped?.Invoke(this.CurrentRecipe);
     }
 
     /// <summary>
@@ -461,6 +477,12 @@ public class CefWrapper : IDisposable, IFrameSource
         var target = url ?? this.Url ?? this.startUrl;
         this.Url = target;
         this.browser.Load(target); // register-before-Load: re-registration already awaited above.
+
+        // D-26: signal the swap so the composition root resets the monitor (clear stale windows + counters,
+        // apply the new recipe's expectMotion, reload the fallback asset). Pitfall P-5 — without this the
+        // new page false-trips on the prior page's dHash window. This wrapper holds NO FrameMonitor
+        // reference: the reset is a CALLBACK the composition root wires (D-28).
+        this.RecipeSwapped?.Invoke(this.CurrentRecipe);
     }
 
     /// <summary>
