@@ -76,6 +76,20 @@ public class Program
             return; // unreachable — RunOnPaintFormatGate always calls Environment.Exit.
         }
 
+        if (args.Any(x => x.StartsWith("--accuweather-probe")))
+        {
+            // D-01/D-16 (VAL-01): the posture+CMP probe gate. Detected BEFORE --smoke (StartsWith("--smoke")
+            // would NOT alias "--accuweather-probe") and before the interactive --ndiname/--port prompts
+            // (same stdin-hang hazard). Runs site-isolation OFF (D-03) against the operator-supplied radar
+            // URL, resolves per-frame contexts via Page.createIsolatedWorld, re-arms readback on frame
+            // re-attach (executionContextDestroyed/frameNavigated), classifies the cross-origin posture +
+            // identifies the live CMP, and emits a structured decision the operator transcribes into the
+            // Task-2 decision record. Always Environment.Exit (0 on a clean classified run, non-zero on
+            // env/CDP failure). NOT a throwaway spike — re-runnable on AccuWeather redesign (D-16).
+            RunAccuWeatherProbe(args, launchCachePath);
+            return; // unreachable — RunAccuWeatherProbe always calls Environment.Exit.
+        }
+
         if (args.Any(x => x.StartsWith("--smoke")))
         {
             RunSmoke(args, launchCachePath);
@@ -1000,6 +1014,472 @@ public class Program
         finally
         {
             try { browserWrapper?.Dispose(); } catch { }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try { Directory.Delete(launchCachePath, true); } catch { }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>
+    /// D-01/D-16/D-05/D-17 (VAL-01): the posture + CMP probe gate. Runs the fork against the
+    /// operator-supplied AccuWeather radar URL with site-isolation OFF (D-03) and produces the
+    /// structured evidence the Task-2 decision record is authored from:
+    /// <list type="bullet">
+    ///   <item><b>Posture (D-01).</b> Whether the radar/consent surface is same-origin or lives in a
+    ///   genuine cross-origin OOPIF — by enumerating every frame's context (built from the
+    ///   <c>Runtime.executionContextCreated.auxData.frameId</c> map), comparing each frame's origin to
+    ///   the main frame's, and reading a proof flag back IN that frame's own context via
+    ///   <c>Page.createIsolatedWorld(frameId)</c> → <c>Runtime.evaluate(contextId)</c>. A genuine
+    ///   cross-origin frame whose isolated-world readback succeeds ⇒ <c>expectsCrossOriginIframes</c>
+    ///   recommendation ON; otherwise default OFF.</item>
+    ///   <item><b>CMP identity (D-05).</b> Detected by EVIDENCE, never assumed: probes for
+    ///   <c>window.OptanonWrapper</c>/<c>window.Optanon</c> (OneTrust) and <c>window.__tcfapi</c>
+    ///   (IAB TCF), recording whichever is present (or <c>unknown/other</c>).</item>
+    ///   <item><b>Candidate selectors.</b> Best-effort DOM heuristics for the consent reject control
+    ///   (text/ARIA per D-02), chrome/ads containers, the target radar element, and the radar play
+    ///   control — confirming the play target is a Mapbox-GL WebGL <c>&lt;canvas&gt;</c> selector-dispatch
+    ///   target, NOT a <c>&lt;video&gt;</c> (D-17).</item>
+    ///   <item><b>Three-outcome cross-origin classification (Q1).</b> The readback is NOT a one-shot
+    ///   poll-at-assert: the probe subscribes <c>Runtime.executionContextDestroyed</c> +
+    ///   <c>Page.frameNavigated</c> and RE-RESOLVES + RE-READS the proof flag on re-attach. A transient
+    ///   miss around an SPA re-mount that resolves on re-read is classified <c>TIMING</c> (expected, not a
+    ///   failure); a context that exists and accepts the isolated-world script but never reads true is
+    ///   <c>GENUINE-FAILURE</c>; a clean read is <c>READS-TRUE</c> (INJ-04 holds live).</item>
+    /// </list>
+    ///
+    /// <para>Mirrors <see cref="RunOnPaintFormatGate"/>'s AsyncContext.Run → CefSettings + D-13
+    /// anti-throttle flags → Cef.Initialize → AppManagement.LogProvenance → bounded wait →
+    /// Environment.Exit discipline, plus the D-03 site-isolation-OFF flags (so OOPIFs collapse onto the
+    /// single <c>GetDevToolsClient()</c> session — the only way the one CefSharp CDP client can reach a
+    /// cross-origin child frame; CefSharp does NOT wrap the CDP Target domain). The persistent-client +
+    /// <c>Page.enable</c>/<c>Runtime.enable</c>-before-navigation pattern is reused from
+    /// <see cref="Tractus.HtmlToNdi.Chromium.Inject.InjectHook.EnsureClientAsync"/>.</para>
+    ///
+    /// <para>Per D-01/T-3-02 the readback uses ONLY the per-frame <c>Runtime.evaluate</c> mechanism —
+    /// the push-based <c>Runtime.addBinding</c> variant (the post-2 deferred upgrade, BACKLOG-INTEGRATION
+    /// item 1) is deliberately NOT built and must not appear in this body. Exit 0 on a clean classified
+    /// run, non-zero on env/CDP failure; a hard timeout makes a stuck init fail fast.</para>
+    /// </summary>
+    private static void RunAccuWeatherProbe(string[] args, string launchCachePath)
+    {
+        const int ProbeTimeoutSeconds = 45;
+        const string ProbeWorldName = "xpn_probe_world";
+
+        var width = 1920;
+        var height = 1080;
+
+        // --url=<operator radar URL>. REQUIRED (D-04 — the dedicated weather-radar page, not the
+        // homepage widget). Fail loud if absent rather than hanging on a default.
+        var urlArg = args.FirstOrDefault(x => x.StartsWith("--url="));
+        if (urlArg is null)
+        {
+            Console.WriteLine("ACCUWEATHER-PROBE FAIL: --url=<operator radar URL> is required (D-04 dedicated weather-radar page).");
+            Log.Error("ACCUWEATHER-PROBE FAIL — missing --url= argument.");
+            Log.CloseAndFlush();
+            Environment.Exit(2);
+        }
+
+        var probeUrl = urlArg!.Substring("--url=".Length);
+        if (string.IsNullOrWhiteSpace(probeUrl))
+        {
+            Console.WriteLine("ACCUWEATHER-PROBE FAIL: --url= was empty.");
+            Log.Error("ACCUWEATHER-PROBE FAIL — empty --url= value.");
+            Log.CloseAndFlush();
+            Environment.Exit(2);
+        }
+
+        // How long to keep re-resolving/re-reading after the first navigation settles — the Q1 re-arm
+        // window that lets an SPA re-mount miss resolve to TIMING rather than GENUINE-FAILURE.
+        var rearmWindowSeconds = 12;
+
+        Log.Information(
+            "ACCUWEATHER-PROBE starting — url={Url} timeout={Timeout}s rearm-window={Rearm}s",
+            probeUrl, ProbeTimeoutSeconds, rearmWindowSeconds);
+
+        var exitCode = 1; // default failure; only set 0 on a clean classified run.
+        CefSharp.OffScreen.ChromiumWebBrowser? browser = null;
+        CefSharp.DevTools.DevToolsClient? dev = null;
+
+        // The JS the isolated-world readback runs IN EACH FRAME. Static probe script (T-3-02: JSON-safe
+        // DATA evaluated in the page; never a page-derived string executed as our control code). Writes a
+        // proof flag into THIS isolated world and reads it back from the SAME world (cross-world globals
+        // do not bleed — research Gotcha "isolated-world subtlety"), and reports origin + CMP evidence +
+        // candidate selectors as a single JSON string the C# side parses.
+        const string ProbeJs = @"
+        (function () {
+          try {
+            // Proof flag — written and read back in THIS isolated world (same-world read, research note).
+            window.__xpnProbeReached = true;
+
+            function sel(list) {
+              for (var i = 0; i < list.length; i++) {
+                try { if (document.querySelector(list[i])) return list[i]; } catch (e) {}
+              }
+              return null;
+            }
+            function byTextRole() {
+              // Consent reject — text/ARIA heuristic (D-02), not coordinate-clicking.
+              var cands = [];
+              var nodes = document.querySelectorAll('button,[role=button],a');
+              for (var i = 0; i < nodes.length && cands.length < 4; i++) {
+                var t = (nodes[i].textContent || '').trim().toLowerCase();
+                var al = (nodes[i].getAttribute && (nodes[i].getAttribute('aria-label') || '')).toLowerCase();
+                if (/reject|decline|necessary only|deny|refuse|do not (accept|consent)/.test(t + ' ' + al)) {
+                  var id = nodes[i].id ? ('#' + nodes[i].id) : null;
+                  cands.push(id || (nodes[i].tagName.toLowerCase() + ' :: ' + t.slice(0, 40)));
+                }
+              }
+              return cands;
+            }
+
+            // CMP identity by EVIDENCE (D-05) — never assumed.
+            var cmp = 'unknown/other';
+            var cmpEvidence = [];
+            if (typeof window.OptanonWrapper !== 'undefined' || typeof window.Optanon !== 'undefined') { cmp = 'OneTrust'; cmpEvidence.push('OptanonWrapper/Optanon'); }
+            if (typeof window.__tcfapi === 'function') { cmp = (cmp === 'OneTrust') ? 'OneTrust+TCF' : 'IAB-TCF'; cmpEvidence.push('__tcfapi'); }
+
+            // Radar play target — confirm canvas (Mapbox-GL WebGL) vs <video> (D-17).
+            var canvas = document.querySelector('canvas');
+            var video = document.querySelector('video');
+            var playKind = canvas ? 'canvas(webgl/mapbox candidate)' : (video ? 'video' : 'none');
+
+            return JSON.stringify({
+              ok: true,
+              proof: window.__xpnProbeReached === true,
+              origin: location.origin,
+              href: location.href,
+              cmp: cmp,
+              cmpEvidence: cmpEvidence,
+              consentCandidates: byTextRole(),
+              consentContainerSelector: sel(['#onetrust-banner-sdk', '#onetrust-consent-sdk', '[id*=consent]', '[class*=consent]', '[class*=cookie]', '[id*=cookie]']),
+              chromeAdsSelector: sel(['header', 'nav', '[class*=ad-]', '[id*=ad-]', '[class*=advert]', 'footer']),
+              targetRadarSelector: sel(['[class*=radar]', '[id*=radar]', '[class*=map]', '[id*=map]', 'canvas']),
+              playCanvasSelector: canvas ? (canvas.id ? ('#' + canvas.id) : 'canvas') : null,
+              playKind: playKind
+            });
+          } catch (e) {
+            return JSON.stringify({ ok: false, error: String(e) });
+          }
+        })();";
+
+        try
+        {
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+
+                // D-13 anti-throttle — kept in sync with the smoke/onpaint paths so rAF / timers do not
+                // stall on the offscreen surface during the probe.
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+                // D-03 site-isolation OFF (scoped to THIS probe run — T-3-01): collapses OOPIFs onto the
+                // single GetDevToolsClient() session so a cross-origin child frame's context is reachable
+                // and createIsolatedWorld/evaluate actually run inside it. This does NOT flip the
+                // production launch posture — that is a separate operator relaunch decision made FROM the
+                // decision record this probe feeds.
+                settings.CefCommandLineArgs.Add("disable-features", "IsolateOrigins,site-per-process");
+                settings.CefCommandLineArgs.Add("disable-site-isolation-trials", "1");
+
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+                AppManagement.LogProvenance();
+
+                Log.Information("ACCUWEATHER-PROBE posture run with site-isolation=OFF (scoped, D-03) — classifying cross-origin target.");
+
+                // Construct on about:blank so the CDP doc-start registration + Page/Runtime.enable land
+                // BEFORE the first real navigation (research Gotcha: enable + register before nav).
+                browser = new CefSharp.OffScreen.ChromiumWebBrowser("about:blank");
+                browser.Size = new System.Drawing.Size(width, height);
+                await browser.WaitForInitialLoadAsync();
+                browser.GetBrowserHost().WindowlessFrameRate = 60;
+
+                // ONE persistent DevToolsClient held for the run (InjectHook.EnsureClientAsync pattern) —
+                // a per-call (using) client would tear down session-scoped registrations on dispose.
+                dev = browser.GetDevToolsClient();
+
+                // frameId -> uniqueContextId map, built from executionContextCreated.auxData.frameId.
+                var frameContexts = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
+                // frames seen via frameNavigated (id -> url), so we can attribute origins + re-arm.
+                var frameUrls = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
+                // re-arm signal: set whenever a context is destroyed or a frame navigates (Q1).
+                var reattachCount = 0;
+
+                static string? FrameIdFromAuxData(object? auxData)
+                {
+                    if (auxData is null) { return null; }
+                    try
+                    {
+                        // AuxData is a CDP JSON object; serialize+parse so we do not depend on its exact
+                        // declared CLR type. It carries { frameId, isDefault, type }.
+                        var json = System.Text.Json.JsonSerializer.Serialize(auxData);
+                        using var doc = System.Text.Json.JsonDocument.Parse(json);
+                        if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                            && doc.RootElement.TryGetProperty("frameId", out var fid)
+                            && fid.ValueKind == System.Text.Json.JsonValueKind.String)
+                        {
+                            return fid.GetString();
+                        }
+                    }
+                    catch { /* best-effort */ }
+                    return null;
+                }
+
+                // Runtime.executionContextCreated replays for existing contexts the instant Runtime.enable
+                // is called, then fires for each new frame's context. Cache by frameId, prefer the
+                // process-stable uniqueId (research Gotcha: uniqueContextId is safer across navigation).
+                dev.Runtime.ExecutionContextCreated += (s, e) =>
+                {
+                    try
+                    {
+                        var ctx = e.Context;
+                        var fid = FrameIdFromAuxData(ctx?.AuxData);
+                        if (fid is not null && ctx is not null)
+                        {
+                            frameContexts[fid] = ctx.UniqueId;
+                        }
+                    }
+                    catch { }
+                };
+
+                // Q1 RE-ARM (not one-shot): a destroyed context means the frame is re-mounting; bump the
+                // signal so the read loop re-resolves + re-reads rather than concluding a miss is failure.
+                dev.Runtime.ExecutionContextDestroyed += (s, e) =>
+                {
+                    System.Threading.Interlocked.Increment(ref reattachCount);
+                };
+
+                // Q1 RE-ARM: a cross-document navigation re-creates the frame's context — record the URL
+                // and bump the signal so the loop re-resolves the (possibly new) context.
+                dev.Page.FrameNavigated += (s, e) =>
+                {
+                    try
+                    {
+                        var f = e.Frame;
+                        if (f?.Id is not null && f.Url is not null)
+                        {
+                            frameUrls[f.Id] = f.Url;
+                            System.Threading.Interlocked.Increment(ref reattachCount);
+                        }
+                    }
+                    catch { }
+                };
+
+                // Enable Page + Runtime BEFORE navigation (research Gotcha) so executionContextCreated
+                // replays existing contexts and frameNavigated fires for the load we are about to drive.
+                await dev.Page.EnableAsync();
+                await dev.Runtime.EnableAsync();
+
+                // Drive the navigation through CDP so frameNavigated/context events are observed for it.
+                await dev.Page.NavigateAsync(probeUrl);
+
+                // Per-frame isolated-world readback. Resolves a context with createIsolatedWorld(frameId)
+                // and evaluates ProbeJs IN that world's contextId. Returns the parsed JSON or null.
+                async Task<System.Text.Json.JsonElement?> ReadFrameAsync(string frameId)
+                {
+                    try
+                    {
+                        var world = await dev!.Page.CreateIsolatedWorldAsync(frameId, ProbeWorldName, true);
+                        var ctxId = world.ExecutionContextId;
+
+                        // Runtime.EvaluateAsync positional params (verified 148 signature): expression,
+                        // objectGroup, includeCommandLineApi, silent, contextId, returnByValue, ...
+                        var resp = await dev.Runtime.EvaluateAsync(
+                            ProbeJs,            // expression
+                            null,               // objectGroup
+                            null,               // includeCommandLineApi
+                            true,               // silent
+                            ctxId,              // contextId — the isolated world we just created
+                            true);              // returnByValue
+
+                        if (resp?.ExceptionDetails is not null)
+                        {
+                            return null;
+                        }
+
+                        var val = resp?.Result?.Value;
+                        if (val is null) { return null; }
+
+                        using var doc = System.Text.Json.JsonDocument.Parse(val.ToString() ?? "null");
+                        return doc.RootElement.Clone();
+                    }
+                    catch
+                    {
+                        return null;
+                    }
+                }
+
+                // Settle window: let the page load + the SPA mount, collecting frame contexts.
+                var deadline = DateTime.UtcNow.AddSeconds(rearmWindowSeconds);
+                var hardDeadline = DateTime.UtcNow.AddSeconds(ProbeTimeoutSeconds);
+
+                string? mainOrigin = null;
+                var perFrame = new System.Collections.Generic.List<(string frameId, string origin, bool proof, bool crossOrigin, System.Text.Json.JsonElement data)>();
+
+                // Q1 three-outcome tracking across the re-arm window.
+                var sawCrossOriginContext = false;     // a cross-origin frame context existed at all
+                var crossOriginReadTrue = false;       // READS-TRUE: isolated-world readback succeeded in it
+                var crossOriginTransientMiss = false;  // missed once, then resolved on re-read => TIMING
+
+                var lastReattach = -1;
+                while (DateTime.UtcNow < deadline && DateTime.UtcNow < hardDeadline)
+                {
+                    var snapshotReattach = System.Threading.Volatile.Read(ref reattachCount);
+                    var frameIds = frameContexts.Keys.ToArray();
+
+                    foreach (var fid in frameIds)
+                    {
+                        var data = await ReadFrameAsync(fid);
+                        if (data is null)
+                        {
+                            // Could not read this frame this pass — if it later resolves, that is the
+                            // TIMING outcome (re-arm). Note it tentatively for cross-origin frames below.
+                            continue;
+                        }
+
+                        var el = data.Value;
+                        if (!(el.TryGetProperty("ok", out var okEl) && okEl.GetBoolean())) { continue; }
+
+                        var origin = el.TryGetProperty("origin", out var oEl) ? (oEl.GetString() ?? "") : "";
+                        var proof = el.TryGetProperty("proof", out var pEl) && pEl.GetBoolean();
+
+                        // The main frame is the one whose origin matches the navigated URL's origin and
+                        // which appears first; capture it once to compute cross-origin.
+                        if (mainOrigin is null)
+                        {
+                            try { mainOrigin = new Uri(probeUrl).GetLeftPart(UriPartial.Authority); } catch { mainOrigin = origin; }
+                        }
+
+                        var crossOrigin = !string.IsNullOrEmpty(origin)
+                            && !string.IsNullOrEmpty(mainOrigin)
+                            && !origin.Equals(mainOrigin, StringComparison.OrdinalIgnoreCase);
+
+                        if (crossOrigin)
+                        {
+                            sawCrossOriginContext = true;
+                            if (proof) { crossOriginReadTrue = true; }
+                        }
+
+                        // Record/replace this frame's latest reading.
+                        perFrame.RemoveAll(t => t.frameId == fid);
+                        perFrame.Add((fid, origin, proof, crossOrigin, el));
+                    }
+
+                    // Re-arm detection: if a re-attach happened and we previously failed to read a
+                    // cross-origin frame that now reads true, that is the TIMING outcome (Q1).
+                    if (snapshotReattach != lastReattach)
+                    {
+                        lastReattach = snapshotReattach;
+                        if (sawCrossOriginContext && !crossOriginReadTrue)
+                        {
+                            // a re-attach occurred while a cross-origin frame had not yet read true —
+                            // the next loop iterations re-resolve it; mark the transient-miss path.
+                            crossOriginTransientMiss = true;
+                        }
+                    }
+
+                    await Task.Delay(250);
+                }
+
+                // ── Classify + emit. ─────────────────────────────────────────────────────────────────
+                // Posture (D-01): ON only if a genuine cross-origin frame existed AND its own-context
+                // readback succeeded (default OFF — T-3-01).
+                var postureOn = sawCrossOriginContext && crossOriginReadTrue;
+
+                // Q1 three-outcome classification of the cross-origin readback.
+                string crossOriginOutcome;
+                if (!sawCrossOriginContext)
+                {
+                    crossOriginOutcome = "N/A (same-origin — no cross-origin radar/consent frame found)";
+                }
+                else if (crossOriginReadTrue && !crossOriginTransientMiss)
+                {
+                    crossOriginOutcome = "READS-TRUE (injection reaches the OOPIF; INJ-04 holds live)";
+                }
+                else if (crossOriginReadTrue && crossOriginTransientMiss)
+                {
+                    crossOriginOutcome = "TIMING (transiently-absent-then-present after re-resolve on re-attach — SPA re-mount window, NOT injection failure)";
+                }
+                else
+                {
+                    crossOriginOutcome = "GENUINE-FAILURE (cross-origin context exists + isolated world created, but the proof flag never read true)";
+                }
+
+                // CMP identity: take the strongest evidence seen across frames (main frame usually).
+                string cmp = "unknown/other";
+                var cmpEvidence = new System.Collections.Generic.List<string>();
+                foreach (var f in perFrame)
+                {
+                    if (f.data.TryGetProperty("cmp", out var cEl))
+                    {
+                        var c = cEl.GetString() ?? "unknown/other";
+                        if (c != "unknown/other") { cmp = c; }
+                    }
+                    if (f.data.TryGetProperty("cmpEvidence", out var evEl) && evEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var item in evEl.EnumerateArray()) { var sIt = item.GetString(); if (sIt is not null && !cmpEvidence.Contains(sIt)) { cmpEvidence.Add(sIt); } }
+                    }
+                }
+
+                // ── Structured stdout the operator transcribes into the decision record. ──────────────
+                Console.WriteLine("==== ACCUWEATHER-PROBE RESULT ====");
+                Console.WriteLine($"operatorUrl: {probeUrl}");
+                Console.WriteLine($"mainOrigin: {mainOrigin}");
+                Console.WriteLine($"framesObserved: {perFrame.Count}");
+                Console.WriteLine($"crossOriginFrameSeen: {sawCrossOriginContext}");
+                Console.WriteLine($"crossOriginReadback: {crossOriginOutcome}");
+                Console.WriteLine($"postureRecommendation(expectsCrossOriginIframes): {(postureOn ? "ON" : "OFF")}");
+                Console.WriteLine($"cmpIdentity: {cmp}  evidence:[{string.Join(",", cmpEvidence)}]");
+                foreach (var f in perFrame)
+                {
+                    Console.WriteLine($"-- frame {f.frameId} origin={f.origin} crossOrigin={f.crossOrigin} proof={f.proof}");
+                    if (f.data.TryGetProperty("consentContainerSelector", out var cc)) { Console.WriteLine($"   consentContainerSelector: {cc.GetString()}"); }
+                    if (f.data.TryGetProperty("consentCandidates", out var ccs) && ccs.ValueKind == System.Text.Json.JsonValueKind.Array) { Console.WriteLine($"   consentCandidates: {string.Join(" | ", ccs.EnumerateArray().Select(x => x.GetString()))}"); }
+                    if (f.data.TryGetProperty("chromeAdsSelector", out var ch)) { Console.WriteLine($"   chromeAdsSelector: {ch.GetString()}"); }
+                    if (f.data.TryGetProperty("targetRadarSelector", out var tr)) { Console.WriteLine($"   targetRadarSelector: {tr.GetString()}"); }
+                    if (f.data.TryGetProperty("playCanvasSelector", out var pc)) { Console.WriteLine($"   playCanvasSelector: {pc.GetString()}"); }
+                    if (f.data.TryGetProperty("playKind", out var pk)) { Console.WriteLine($"   playKind(canvas=Mapbox/WebGL, NOT video per D-17): {pk.GetString()}"); }
+                }
+                Console.WriteLine("==== END ACCUWEATHER-PROBE RESULT ====");
+
+                Log.Information(
+                    "ACCUWEATHER-PROBE classified — posture={Posture} cmp={Cmp} crossOrigin={Outcome} frames={Frames}",
+                    postureOn ? "ON" : "OFF", cmp, crossOriginOutcome, perFrame.Count);
+
+                // A clean classified run (we observed at least one frame and produced a classification) is
+                // exit 0 even when posture=OFF / outcome=GENUINE-FAILURE — those are valid EVIDENCE the
+                // record captures. Non-zero is reserved for env/CDP failure (no frame ever read).
+                exitCode = perFrame.Count > 0 ? 0 : 3;
+                if (exitCode != 0)
+                {
+                    Console.WriteLine("ACCUWEATHER-PROBE FAIL: no frame context was ever read (env/CDP failure, not a page result).");
+                    Log.Error("ACCUWEATHER-PROBE FAIL — no frame read within the window (env/CDP).");
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("ACCUWEATHER-PROBE FAILED — exception: {@ex}", ex);
+            Console.WriteLine($"ACCUWEATHER-PROBE FAIL: exception {ex.Message}");
+            exitCode = 1;
+        }
+        finally
+        {
+            try { dev?.Dispose(); } catch { }
+            try { browser?.Dispose(); } catch { }
 
             if (Directory.Exists(launchCachePath))
             {
