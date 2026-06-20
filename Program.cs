@@ -13,6 +13,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Tractus.HtmlToNdi.Chromium;
 using Tractus.HtmlToNdi.Chromium.Inject;
+using Tractus.HtmlToNdi.Chromium.Monitor;
 using Tractus.HtmlToNdi.Models;
 
 namespace Tractus.HtmlToNdi;
@@ -48,6 +49,19 @@ public class Program
             // interactive prompts (same stdin-hang hazard). Always Environment.Exit.
             RunInjectSmoke(args, launchCachePath);
             return; // unreachable — RunInjectSmoke always calls Environment.Exit.
+        }
+
+        if (args.Any(x => x.StartsWith("--onpaint-format")))
+        {
+            // D-22/D-29 (MON-01): the OnPaint pixel-format readback gate — the literal FIRST task of
+            // Phase 2. Detected BEFORE --smoke (StartsWith("--smoke") would NOT alias
+            // "--onpaint-format") and before the interactive --ndiname/--port prompts (same stdin-hang
+            // hazard). Renders a known 3-region semi-transparent fixture, reads back the REAL pre-send
+            // OnPaint bytes, asserts BGRA channel order + per-region alpha value + premultiplied-vs-
+            // straight + the all-alpha-0 blank case. Always Environment.Exit (exit 0 on a clean STRAIGHT
+            // determination, non-zero on fail/drift).
+            RunOnPaintFormatGate(args, launchCachePath);
+            return; // unreachable — RunOnPaintFormatGate always calls Environment.Exit.
         }
 
         if (args.Any(x => x.StartsWith("--smoke")))
@@ -636,6 +650,247 @@ public class Program
         Log.CloseAndFlush();
         Environment.Exit(exitCode);
     }
+
+    /// <summary>
+    /// D-22 / D-29 (MON-01): the OnPaint pixel-format readback gate — the literal FIRST task of Phase
+    /// 2, run BEFORE any luminance / variance / freeze / fallback / keying code is written. Mirrors
+    /// <see cref="RunSmoke"/>'s CEF-init + load-local-HTML + bounded-wait + Environment.Exit discipline,
+    /// but instead of sending a frame it CAPTURES the real pre-send OnPaint bytes and asserts the actual
+    /// pixel format:
+    /// <list type="bullet">
+    ///   <item>BGRA channel order (Blue/Green bytes ~0, Red dominant in a pure-red region);</item>
+    ///   <item>per-region alpha VALUE — A≈255 in the opaque region, A≈128 in the 50%-alpha region,
+    ///   A≈0 in the fully-transparent region (the all-alpha-0 blank case the Plan-03 BlankDetector
+    ///   depends on);</item>
+    ///   <item>premultiplied-vs-straight — in the 50%-alpha region, R≈255 ⇒ STRAIGHT, R≈128 ⇒
+    ///   PREMULTIPLIED (RESEARCH Pitfall P-1).</item>
+    /// </list>
+    ///
+    /// <para>D-29a: the bytes are captured via the PRE-SEND seam in <see cref="CefWrapper.OnBrowserPaint"/>
+    /// (a one-shot copy taken BEFORE the <c>NdiSenderPtr==Zero</c> guard at CefWrapper.cs:213) — no NDI
+    /// sender is attached, so the gate reads the REAL bytes CEF painted, not a downstream FourCC.
+    /// D-29c: the gate runs on the SAME production wrapper that now sets a transparent
+    /// <see cref="CefSharp.BrowserSettings.BackgroundColor"/>, so regions 2/3 read SOURCE alpha.
+    /// D-29d: a PREMULTIPLIED determination is surfaced as a loud WARN (the un-premult contingency is
+    /// recorded in the plan SUMMARY) and FAILS the gate (observed != <see cref="AlphaConvention.Expected"/>);
+    /// the keying correction itself is the Phase-3 follow-up — this gate does NOT change the send path.</para>
+    ///
+    /// <para>Exit 1 by default, 0 only on a clean STRAIGHT determination with all per-region assertions
+    /// passing; a hard timeout (mirrors the RunSmoke Task.WhenAny pattern) makes a stuck init fail fast.</para>
+    /// </summary>
+    private static void RunOnPaintFormatGate(string[] args, string launchCachePath)
+    {
+        const int GateTimeoutSeconds = 20;
+
+        // Tolerance band absorbing CEF gamma/rounding around the expected per-channel values (D-22).
+        const int Tol = 16;
+
+        var width = 1920;
+        var height = 1080;
+
+        // --onpaint-format or --onpaint-format=<url>. Default to the committed 3-region fixture beside
+        // the exe, loaded file:// (no recipe match / iframe / network needed — just a known-color page).
+        var gateArg = args.FirstOrDefault(x => x.StartsWith("--onpaint-format")) ?? "--onpaint-format";
+        string gateUrl;
+        var eq = gateArg.IndexOf('=');
+        if (eq >= 0 && eq < gateArg.Length - 1)
+        {
+            gateUrl = gateArg.Substring(eq + 1);
+        }
+        else
+        {
+            var localHtml = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tests-fixtures", "onpaint-format.html");
+            if (!File.Exists(localHtml))
+            {
+                Console.WriteLine($"ONPAINT-FORMAT FAIL: fixture missing at {localHtml}");
+                Log.Error("ONPAINT-FORMAT FAIL — fixture missing at {Path}", localHtml);
+                Log.CloseAndFlush();
+                Environment.Exit(1);
+            }
+
+            gateUrl = new Uri(localHtml).AbsoluteUri; // file:///.../tests-fixtures/onpaint-format.html
+        }
+
+        Log.Information(
+            "ONPAINT-FORMAT starting — url={Url} expected-alpha={Expected} timeout={Timeout}s",
+            gateUrl, AlphaConvention.Expected, GateTimeoutSeconds);
+
+        var exitCode = 1; // default failure; only set 0 on a clean STRAIGHT determination.
+
+        try
+        {
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+
+                // D-13 anti-throttle — kept in sync with the smoke/normal paths.
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+                AppManagement.LogProvenance();
+
+                // D-29a: arm the pre-send capture latch — NO NDI sender is created, so the real bytes
+                // are reached only via the copy BEFORE the NdiSenderPtr==Zero guard in OnBrowserPaint.
+                // D-29c: this wrapper now constructs the browser with a transparent BackgroundColor.
+                browserWrapper = new CefWrapper(width, height, gateUrl)
+                {
+                    CaptureNextPaint = true,
+                };
+
+                await browserWrapper.InitializeWrapperAsync();
+
+                // Bounded wait for the one-shot pre-send capture (mirrors RunSmoke's Task.WhenAny).
+                var captureTask = browserWrapper.PaintCaptured;
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(GateTimeoutSeconds));
+                if (await Task.WhenAny(captureTask, timeoutTask) != captureTask)
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: no non-blank OnPaint captured within timeout");
+                    Log.Error("ONPAINT-FORMAT FAIL — no non-blank OnPaint within {Timeout}s.", GateTimeoutSeconds);
+                    return; // exitCode stays 1
+                }
+
+                var buffer = browserWrapper.CapturedBuffer;
+                var w = browserWrapper.CapturedWidth;
+                var h = browserWrapper.CapturedHeight;
+                if (buffer is null || w <= 0 || h <= 0)
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: captured buffer was null/empty");
+                    Log.Error("ONPAINT-FORMAT FAIL — captured buffer null/empty (w={W} h={H}).", w, h);
+                    return;
+                }
+
+                // Sample several pixels per region at the band CENTERS (1/6, 1/2, 5/6 of width), down
+                // a vertical mid-strip, to avoid anti-aliased band edges. Require per-region consistency.
+                var y = h / 2;
+                var x1 = w / 6;       // region 1 — opaque red
+                var x2 = w / 2;       // region 2 — 50%-alpha red
+                var x3 = (5 * w) / 6; // region 3 — fully transparent
+
+                var r1 = SampleRegion(buffer, w, h, x1, y);
+                var r2 = SampleRegion(buffer, w, h, x2, y);
+                var r3 = SampleRegion(buffer, w, h, x3, y);
+
+                Log.Information(
+                    "ONPAINT-FORMAT samples — opaque(B={B1} G={G1} R={R1} A={A1}) half(B={B2} G={G2} R={R2} A={A2}) transparent(B={B3} G={G3} R={R3} A={A3})",
+                    r1.B, r1.G, r1.R, r1.A, r2.B, r2.G, r2.R, r2.A, r3.B, r3.G, r3.R, r3.A);
+
+                // ── Region 1: OPAQUE red → channel order + opaque alpha. B≈0 G≈0 R≈255 A≈255. ─────────
+                if (!(Near(r1.B, 0, Tol) && Near(r1.G, 0, Tol) && Near(r1.R, 255, Tol) && Near(r1.A, 255, Tol)))
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: opaque-red region not B≈0 G≈0 R≈255 A≈255 (channel order / opaque alpha)");
+                    Log.Error("ONPAINT-FORMAT FAIL — opaque region B={B} G={G} R={R} A={A}.", r1.B, r1.G, r1.R, r1.A);
+                    return;
+                }
+
+                // ── Region 3: FULLY TRANSPARENT → the all-alpha-0 blank case (Plan-03 BlankDetector). ──
+                if (!Near(r3.A, 0, Tol))
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: transparent region alpha is not ≈0 (all-alpha-0 blank case)");
+                    Log.Error("ONPAINT-FORMAT FAIL — transparent region A={A} (expected ≈0).", r3.A);
+                    return;
+                }
+
+                // ── Region 2: 50%-alpha red — channel order + alpha value + premultiplied-vs-straight. ─
+                // (a) CHANNEL ORDER: Blue/Green ≈0, Red dominant → bytes are B,G,R,A.
+                if (!(Near(r2.B, 0, Tol) && Near(r2.G, 0, Tol) && r2.R > r2.B && r2.R > r2.G))
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: 50%-alpha region channel order not BGRA (B/G not ≈0 or R not dominant)");
+                    Log.Error("ONPAINT-FORMAT FAIL — half-alpha order B={B} G={G} R={R}.", r2.B, r2.G, r2.R);
+                    return;
+                }
+
+                // (b) ALPHA VALUE: the A byte carries source alpha (~128 = 0.5*255).
+                if (!Near(r2.A, 128, Tol))
+                {
+                    Console.WriteLine("ONPAINT-FORMAT FAIL: 50%-alpha region alpha byte not ≈128 (source alpha not preserved)");
+                    Log.Error("ONPAINT-FORMAT FAIL — half-alpha A={A} (expected ≈128).", r2.A);
+                    return;
+                }
+
+                // (c) PREMULTIPLIED-VS-STRAIGHT: R≈255 ⇒ STRAIGHT, R≈128 ⇒ color scaled by alpha ⇒ PREMULTIPLIED.
+                AlphaMode observed;
+                if (Near(r2.R, 255, Tol))
+                {
+                    observed = AlphaMode.Straight;
+                }
+                else if (Near(r2.R, 128, Tol))
+                {
+                    observed = AlphaMode.Premultiplied;
+                }
+                else
+                {
+                    Console.WriteLine($"ONPAINT-FORMAT FAIL: 50%-alpha red byte R={r2.R} is neither ≈255 (straight) nor ≈128 (premultiplied)");
+                    Log.Error("ONPAINT-FORMAT FAIL — half-alpha R={R} ambiguous (neither 255 nor 128).", r2.R);
+                    return;
+                }
+
+                Log.Information("ONPAINT-FORMAT determined alpha mode = {Observed} (expected {Expected}).", observed, AlphaConvention.Expected);
+
+                // Compare observed vs the compile-time EXPECTED constant; FAIL LOUDLY on drift (D-29d).
+                if (observed != AlphaConvention.Expected)
+                {
+                    Log.Warning(
+                        "ONPAINT-FORMAT ALPHA-MODE DRIFT — observed {Observed}, expected {Expected}. " +
+                        "PITFALL P-1 IS LIVE: CEF OnPaint is PREMULTIPLIED while the send path declares straight BGRA. " +
+                        "Un-premult CONTINGENCY required BEFORE any downstream pixel math (Plan 02 pump / Plan 03 detectors / " +
+                        "Plan 04 fallback): a 256-entry per-channel un-premultiply LUT (O(1)/pixel) OR a CEF straight-alpha " +
+                        "command-line flag. The keying CORRECTION is the Phase-3 follow-up — the send path is NOT changed here.",
+                        observed, AlphaConvention.Expected);
+                    Console.WriteLine($"ONPAINT-FORMAT FAIL: alpha-mode drift — observed {observed}, expected {AlphaConvention.Expected} (Pitfall P-1; see un-premult contingency)");
+                    return; // exitCode stays 1 — drift is RED.
+                }
+
+                Log.Information("ONPAINT-FORMAT OK — BGRA straight alpha confirmed; channel order + per-region alpha + all-alpha-0 blank all asserted.");
+                Console.WriteLine("ONPAINT-FORMAT OK");
+                exitCode = 0;
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("ONPAINT-FORMAT FAILED — exception: {@ex}", ex);
+            Console.WriteLine($"ONPAINT-FORMAT FAIL: exception {ex.Message}");
+            exitCode = 1;
+        }
+        finally
+        {
+            try { browserWrapper?.Dispose(); } catch { }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try { Directory.Delete(launchCachePath, true); } catch { }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>
+    /// D-22: read one BGRA pixel out of the captured pre-send OnPaint buffer at (x,y), using the same
+    /// byte-offset convention as <c>IsBlankBuffer</c> (off+0=B, off+1=G, off+2=R, off+3=A). Bounds-
+    /// clamped (T-2-01-1 — read-only, never write through the buffer).
+    /// </summary>
+    private static (byte B, byte G, byte R, byte A) SampleRegion(byte[] buffer, int width, int height, int x, int y)
+    {
+        x = Math.Clamp(x, 0, width - 1);
+        y = Math.Clamp(y, 0, height - 1);
+        var off = ((long)y * width + x) * 4;
+        return (buffer[off + 0], buffer[off + 1], buffer[off + 2], buffer[off + 3]);
+    }
+
+    /// <summary>D-22: within the per-channel tolerance band (absorbs CEF gamma/rounding).</summary>
+    private static bool Near(int value, int expected, int tolerance)
+        => Math.Abs(value - expected) <= tolerance;
 
     /// <summary>
     /// D-14/D-22: the inject-on-load ACCEPTANCE GATE. Additive in-process self-check that mirrors

@@ -82,6 +82,36 @@ public class CefWrapper : IDisposable, IFrameSource
     /// </summary>
     public Task SmokeFrameSent => this.smokeFrameSent.Task;
 
+    // D-29a (MON-01): pre-send OnPaint capture latch for the --onpaint-format gate. OnBrowserPaint
+    // returns at :213 when Program.NdiSenderPtr == nint.Zero — BEFORE lastPaint (:225) and the
+    // FrameReady event (:248) — so a no-NDI gate cannot capture the real bytes through either of
+    // those downstream seams. This latch copies e.BufferHandle (Height*Width*4 bytes) into a
+    // retained managed buffer BEFORE that guard returns, so the gate reads the REAL pre-send pixels
+    // exactly as CEF painted them (no NDI sender required, no live send path altered). Armed only by
+    // the gate; on the normal --url= path CaptureNextPaint stays false and OnBrowserPaint is
+    // unchanged (the copy block is skipped). One-shot: it disarms after the first non-blank paint.
+    public bool CaptureNextPaint { get; set; }
+    private bool capturedPaint;
+    private byte[]? capturedBuffer;
+    private int capturedWidth;
+    private int capturedHeight;
+    private readonly TaskCompletionSource<bool> paintCaptured =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// D-29a: completes when exactly one non-blank OnPaint buffer has been copied under
+    /// <see cref="CaptureNextPaint"/>. Only meaningful when the gate armed the latch.
+    /// </summary>
+    public Task PaintCaptured => this.paintCaptured.Task;
+
+    /// <summary>
+    /// D-29a: the copied pre-send OnPaint bytes (BGRA, <see cref="CapturedWidth"/> *
+    /// <see cref="CapturedHeight"/> * 4) the gate reads back. Null until a paint is captured.
+    /// </summary>
+    public byte[]? CapturedBuffer => this.capturedBuffer;
+    public int CapturedWidth => this.capturedWidth;
+    public int CapturedHeight => this.capturedHeight;
+
     public CefWrapper(int width, int height, string initialUrl)
     {
         this.Width = width;
@@ -93,7 +123,7 @@ public class CefWrapper : IDisposable, IFrameSource
         // initialUrl straight to the browser, auto-loading it immediately — the D-16 root cause).
         this.startUrl = initialUrl;
 
-        this.browser = new ChromiumWebBrowser("about:blank")
+        this.browser = new ChromiumWebBrowser("about:blank", TransparentBrowserSettings())
         {
             AudioHandler = new CustomAudioHandler(),
         };
@@ -208,8 +238,49 @@ public class CefWrapper : IDisposable, IFrameSource
         }
     }
 
+    /// <summary>
+    /// D-29c (MON-01): the explicit TRANSPARENT browser background. There was NO transparent-bg
+    /// setting in the wrapper before this — the spike's keyability rode an implicit CefSharp.OffScreen
+    /// default. Setting <see cref="BrowserSettings.BackgroundColor"/> to fully-transparent ARGB
+    /// (0x00000000) makes CEF composite onto a transparent surface, so a 50%-alpha / fully-transparent
+    /// page region paints back as SOURCE alpha (A&lt;255) instead of an opaque composited pixel. This is
+    /// the SAME production path the live keyable NDI send uses (applied in both the ctor and
+    /// <see cref="RecreateBrowserCoreAsync"/>), so the --onpaint-format gate exercises the real
+    /// transparency path, not a test-only one. Without this, the MON-01 alpha readback would measure
+    /// opaque composited pixels and pass while proving the wrong thing.
+    /// </summary>
+    private static BrowserSettings TransparentBrowserSettings()
+    {
+        return new BrowserSettings
+        {
+            // Fully-transparent ARGB background (A=0). CefSharp.OffScreen honors this on the OnPaint
+            // surface so source alpha survives into the paint buffer.
+            BackgroundColor = 0x00000000u,
+        };
+    }
+
     private void OnBrowserPaint(object? sender, OnPaintEventArgs e)
     {
+        // D-29a (MON-01): pre-send capture for the --onpaint-format gate, taken BEFORE the
+        // NdiSenderPtr==Zero guard below — the only place the REAL pre-send OnPaint bytes are reachable
+        // with no NDI sender attached (lastPaint/:225 and FrameReady/:248 are both downstream of the
+        // guard). One-shot + blank-skipping (a never-painting SwiftShader init must not count). On the
+        // normal path CaptureNextPaint is false and this block is skipped entirely.
+        if (this.CaptureNextPaint && !this.capturedPaint)
+        {
+            if (!IsBlankBuffer(e.BufferHandle, e.Width, e.Height))
+            {
+                var byteCount = checked(e.Width * e.Height * 4);
+                var copy = new byte[byteCount];
+                System.Runtime.InteropServices.Marshal.Copy(e.BufferHandle, copy, 0, byteCount);
+                this.capturedBuffer = copy;
+                this.capturedWidth = e.Width;
+                this.capturedHeight = e.Height;
+                this.capturedPaint = true;
+                this.paintCaptured.TrySetResult(true);
+            }
+        }
+
         if (Program.NdiSenderPtr == nint.Zero)
         {
             return;
@@ -406,7 +477,7 @@ public class CefWrapper : IDisposable, IFrameSource
         }
 
         // step 3: recreate on about:blank (deferred Load — InjectHook re-registers before the caller Loads).
-        this.browser = new ChromiumWebBrowser("about:blank")
+        this.browser = new ChromiumWebBrowser("about:blank", TransparentBrowserSettings())
         {
             AudioHandler = new CustomAudioHandler(),
         };

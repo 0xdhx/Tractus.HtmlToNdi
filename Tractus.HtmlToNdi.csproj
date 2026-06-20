@@ -96,4 +96,14 @@
     </None>
   </ItemGroup>
 
+  <!-- D-22/D-29b (MON-01): the OnPaint-format gate (the onpaint-format self-check arg) loads this
+       committed 3-region (opaque / 50%-alpha / fully-transparent) known-color fixture to read back
+       the REAL OnPaint bytes and assert channel order + alpha value + premultiplied-vs-straight.
+       Must ship beside the exe. -->
+  <ItemGroup>
+    <None Update="tests-fixtures\onpaint-format.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

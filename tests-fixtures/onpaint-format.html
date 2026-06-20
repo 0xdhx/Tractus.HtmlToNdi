@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OnPaint Format Gate Fixture</title>
+  <!--
+    D-22 / D-29b MON-01 OnPaint-FORMAT READBACK FIXTURE for the --onpaint-format self-check (Plan 02-01).
+
+    This is the deterministic, CI-runnable proof surface that confirms the ACTUAL pixel format the
+    fork's CEF 148.0.90 build hands to OnBrowserPaint (CefWrapper.cs:211) — channel order (BGRA),
+    alpha VALUE per region, and premultiplied-vs-straight alpha — BEFORE any luminance / variance /
+    freeze / fallback / keying code is written. It is the literal FIRST task of Phase 2.
+
+    THREE KNOWN REGIONS over a TRANSPARENT page background (D-29b — three regions, not a single
+    full-viewport fill, so the all-alpha-0 transparent case cannot be made ambiguous by an opaque
+    full-viewport page):
+
+      Region 1 — OPAQUE red       rgba(255,0,0,1)    left   third  → expect B=0  G=0  R=255 A=255
+      Region 2 — 50%-alpha red    rgba(255,0,0,0.5)  middle third  → expect B=0  G=0  A~128, and
+                                                                       R~255 if STRAIGHT, R~128 if PREMULTIPLIED
+      Region 3 — FULLY TRANSPARENT (nothing painted) right third   → expect A=0 (the all-alpha-0 blank
+                                                                       case the Plan-03 BlankDetector relies on)
+
+    The gate sets a TRANSPARENT BrowserSettings.BackgroundColor (D-29c) on the SAME production
+    CefWrapper path the live keyable send uses, so regions 2 and 3 read back as SOURCE alpha, not
+    opaque composited pixels. WITHOUT the transparent background the page background would composite
+    behind regions 2/3 and the gate would pass while proving the wrong thing.
+
+    SwiftShader-safe (D-05): plain CSS solid-color fills only — no WebGL / canvas / animation — so the
+    channel-order + alpha-value readback is valid under the GPU-less CI runner. (The premultiplied-vs-
+    straight determination is the host gate's authoritative proof; CI still gates channel order + alpha
+    presence — see ci.yml step comment.)
+
+    The regions are laid out as three full-height vertical bands at FIXED fractional x-positions so the
+    gate can sample pixel columns at the band CENTERS (1/6, 1/2, 5/6 of width) and avoid anti-aliased
+    band edges. The data-* attributes record the intended rgba for documentation only — the gate does
+    not read the DOM, it reads the painted bytes.
+  -->
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      /* Transparent page background — nothing is painted where no band covers (region 3). */
+      background: transparent;
+    }
+    #bands {
+      display: flex;
+      width: 100vw;
+      height: 100vh;
+    }
+    .band {
+      height: 100%;
+      flex: 1 1 0;
+    }
+    /* Region 1 — OPAQUE pure red (left third). */
+    #region-opaque      { background-color: rgba(255, 0, 0, 1); }
+    /* Region 2 — 50%-alpha pure red (middle third) — the straight-vs-premultiplied discriminator. */
+    #region-halfalpha   { background-color: rgba(255, 0, 0, 0.5); }
+    /* Region 3 — fully transparent (right third) — NOTHING painted; page background shows through. */
+    #region-transparent { background-color: rgba(0, 0, 0, 0); }
+  </style>
+</head>
+<body>
+  <div id="bands">
+    <div class="band" id="region-opaque"      data-xpn-rgba="255,0,0,1"></div>
+    <div class="band" id="region-halfalpha"   data-xpn-rgba="255,0,0,0.5"></div>
+    <div class="band" id="region-transparent" data-xpn-rgba="0,0,0,0"></div>
+  </div>
+</body>
+</html>
