@@ -1085,16 +1085,25 @@ public class Program
     /// </summary>
     private static void RunBeaconDamageGate(string[] args, string launchCachePath)
     {
-        const int GateTimeoutSeconds = 25;
+        const int GateTimeoutSeconds = 30;
 
-        // How many rAF frames to let elapse between the two captures so the beacon's moving bar advances a
-        // visible amount (the bar cycles every ~16 ticks; a short settle is plenty). A Task.Delay between the
-        // first capture and the re-arm.
-        const int InterCaptureDelayMs = 250;
+        // The MEASUREMENT WINDOW: once real content has rendered, drive the REAL FrameMonitor over the
+        // fixture for this long and sample the production beacon-state every sampler tick (the monitor
+        // runs at 5 Hz — D-06/D-31 — so ~2s yields ~10 distinct samples of the rAF-mutating corner). This
+        // replaces the old broken two-point capture (which compared two byte-identical EARLY frames).
+        const int MeasureWindowMs = 2500;
 
-        // The summed |RGB delta| over the sampled beacon pixels above which the two captures count as
-        // DIFFERENT (real captured damage). Identical buffers read 0; a real tick moves R/G/B by tens.
-        const int DiffBound = 6;
+        // How long to wait for the page's REAL content (the opaque green #content + the beacon's first
+        // opaque draw) to reach the captured straight buffer BEFORE the window opens. The old gate measured
+        // the initial blank/white LOAD frame — we explicitly wait past it by requiring a PRESENT beacon
+        // sample (non-trivial content in the beacon region) from the monitor, bounded by this settle cap.
+        const int ContentSettleCapMs = 12_000;
+
+        // A4 HOLDS iff, across the window, the monitor classifies the beacon as TICKING (BeaconLiveness.True)
+        // on at least this many DISTINCT samples — i.e. the alpha-0 per-tick RGB mutation reaches the
+        // straight OnPaint buffer the FrameMonitor samples, the actual production detection path. One ticking
+        // sample is real proof; we require a small margin so a single fluke does not decide the gate.
+        const int MinTickingSamples = 3;
 
         var width = 1920;
         var height = 1080;
@@ -1122,37 +1131,12 @@ public class Program
             gateUrl = new Uri(localHtml).AbsoluteUri;
         }
 
-        // The beacon-region sample coords mirror MonitorDefaults.Beacon* (top-left 16x16). Sample a 4x4 grid
-        // across the canvas extent and sum B+G+R, matching the FrameMonitor beacon sample shape.
-        const int BeaconOriginX = 0;
-        const int BeaconOriginY = 0;
-        const int BeaconSizePx = 16;
-
-        static long SumBeaconRgb(byte[] buffer, int w, int h)
-        {
-            const int Grid = 4;
-            long sum = 0;
-            for (var gy = 0; gy < Grid; gy++)
-            {
-                for (var gx = 0; gx < Grid; gx++)
-                {
-                    var px = BeaconOriginX + (gx * BeaconSizePx) / Grid;
-                    var py = BeaconOriginY + (gy * BeaconSizePx) / Grid;
-                    if (px >= w || py >= h) { continue; }
-                    var off = ((long)py * w + px) * 4;
-                    if (off < 0 || off + 2 >= buffer.Length) { continue; }
-                    sum += buffer[off + 0] + buffer[off + 1] + buffer[off + 2]; // B+G+R
-                }
-            }
-
-            return sum;
-        }
-
         Log.Information(
-            "BEACON-DAMAGE starting — url={Url} timeout={Timeout}s inter-capture={Delay}ms",
-            gateUrl, GateTimeoutSeconds, InterCaptureDelayMs);
+            "BEACON-DAMAGE starting — url={Url} timeout={Timeout}s window={Window}ms (real-FrameMonitor beacon-state path)",
+            gateUrl, GateTimeoutSeconds, MeasureWindowMs);
 
-        var exitCode = 1; // default failure; only set 0 when the two captures' beacon RGB DIFFERS.
+        var exitCode = 1; // default failure; only set 0 when the production beacon-state ticks over the window.
+        FrameMonitor? monitor = null;
 
         try
         {
@@ -1167,7 +1151,8 @@ public class Program
                 settings.RootCachePath = launchCachePath;
                 settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
 
-                // D-13 anti-throttle — kept in sync with the smoke/normal/onpaint paths (rAF callbacks alive).
+                // D-13 anti-throttle — kept in sync with the smoke/normal/onpaint paths (rAF callbacks alive
+                // so the OSR browser emits CONTINUOUS animated OnPaints, exactly as RunMonitorSmoke relies on).
                 settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
                 settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
                 settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
@@ -1176,82 +1161,125 @@ public class Program
                 Cef.Initialize(settings);
                 AppManagement.LogProvenance();
 
-                // Production wrapper (transparent BackgroundColor + un-premult LUT); arm the FIRST capture.
-                browserWrapper = new CefWrapper(width, height, gateUrl)
+                // Production wrapper (transparent BackgroundColor + un-premult LUT). NO CaptureNextPaint /
+                // ReArmCapture here — those are the broken one-shot capture seam. Instead we drive the REAL
+                // FrameMonitor, which continuously copies the straight front buffer off IFrameSource.FrameReady
+                // (every OnPaint) and classifies the beacon region every 5 Hz tick — the SAME detection path
+                // that runs on air. expectMotion=true so the beacon is sampled as a motion source (D-15).
+                browserWrapper = new CefWrapper(width, height, gateUrl);
+
+                // Detection-only monitor: no refresh delegate (we are not exercising recovery), no pump/NDI
+                // (we read beacon-state directly, not the sent stream). expectMotion=true via the recipe so the
+                // monitor's UpdateBeaconState path is the live one. This mirrors RunMonitorSmoke's
+                // source -> monitor topology, minus the pump+fallback the freeze/recovery test needs.
+                monitor = new FrameMonitor(browserWrapper, refreshDelegate: null);
+                monitor.ApplyRecipe(new Recipe { UrlMatch = gateUrl, ExpectMotion = true });
+
+                // Observe the production per-sample beacon classification across the window (D-24 read-only
+                // seam — the exact value /health surfaces and the BeaconClassify tests assert). We tally the
+                // 3-state liveness the monitor derives from the captured straight buffer each tick.
+                var firstPresentTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var samplesTotal = 0;
+                var samplesPresent = 0;   // monitor saw beacon RGB energy (real content rendered, not blank load)
+                var samplesTicking = 0;   // BeaconLiveness.True  — RGB CHANGED since the prior sample
+                var samplesFrozen = 0;    // BeaconLiveness.False — RGB present but UNCHANGED while motion expected
+                var samplesAbsent = 0;    // BeaconLiveness.Absent — no beacon RGB energy yet (blank/load frame)
+                var windowOpen = false;
+                var lockObj = new object();
+
+                monitor.SampleObserved += snap =>
                 {
-                    CaptureNextPaint = true,
+                    lock (lockObj)
+                    {
+                        switch (snap.BeaconState)
+                        {
+                            case BeaconLiveness.Absent:
+                                samplesAbsent++;
+                                break;
+                            case BeaconLiveness.True:
+                            case BeaconLiveness.False:
+                                // A PRESENT beacon means the real content (opaque corner) has reached the
+                                // captured buffer — past the initial blank/white load frame. Open the window
+                                // on the first present sample so we measure CONFIRMED-RENDERING ticks only.
+                                if (!firstPresentTcs.Task.IsCompleted)
+                                {
+                                    firstPresentTcs.TrySetResult(true);
+                                }
+
+                                if (windowOpen)
+                                {
+                                    samplesTotal++;
+                                    samplesPresent++;
+                                    if (snap.BeaconState == BeaconLiveness.True) { samplesTicking++; }
+                                    else { samplesFrozen++; }
+                                }
+
+                                break;
+                        }
+                    }
                 };
 
+                monitor.StartSampling();
                 await browserWrapper.InitializeWrapperAsync();
 
-                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(GateTimeoutSeconds));
-
-                // ── CAPTURE 1 ──────────────────────────────────────────────────────────────────────────
-                if (await Task.WhenAny(browserWrapper.PaintCaptured, timeoutTask) != browserWrapper.PaintCaptured)
+                // ── WAIT FOR REAL CONTENT ───────────────────────────────────────────────────────────────
+                // Do NOT measure the initial blank/white load frame. Block until the monitor reports the
+                // first PRESENT beacon sample (real opaque content in the captured straight buffer), bounded.
+                var settleTimeout = Task.Delay(ContentSettleCapMs);
+                if (await Task.WhenAny(firstPresentTcs.Task, settleTimeout) != firstPresentTcs.Task)
                 {
-                    Console.WriteLine("BEACON-DAMAGE FAIL: no first non-blank OnPaint captured within timeout");
-                    Log.Error("BEACON-DAMAGE FAIL — no first non-blank OnPaint within {Timeout}s.", GateTimeoutSeconds);
+                    Console.WriteLine("BEACON-DAMAGE FAIL: beacon region never became present (no real opaque content reached the captured straight buffer within the settle cap)");
+                    Log.Error("BEACON-DAMAGE FAIL — beacon never PRESENT within {Cap}ms (page never rendered content / beacon culled).", ContentSettleCapMs);
                     return;
                 }
 
-                var buf1 = browserWrapper.CapturedBuffer;
-                var w1 = browserWrapper.CapturedWidth;
-                var h1 = browserWrapper.CapturedHeight;
-                if (buf1 is null || w1 <= 0 || h1 <= 0)
+                // Real content is on the captured buffer. Open the measurement window and let the production
+                // monitor classify the rAF-mutating beacon across many distinct sampler ticks.
+                lock (lockObj) { windowOpen = true; }
+                Log.Information("BEACON-DAMAGE window OPEN — real content present; sampling beacon-state for {Window}ms.", MeasureWindowMs);
+                await Task.Delay(MeasureWindowMs);
+                lock (lockObj) { windowOpen = false; }
+
+                int total, present, ticking, frozen, absent;
+                lock (lockObj)
                 {
-                    Console.WriteLine("BEACON-DAMAGE FAIL: first captured buffer null/empty");
-                    Log.Error("BEACON-DAMAGE FAIL — first capture null/empty (w={W} h={H}).", w1, h1);
-                    return;
+                    total = samplesTotal;
+                    present = samplesPresent;
+                    ticking = samplesTicking;
+                    frozen = samplesFrozen;
+                    absent = samplesAbsent;
                 }
-
-                // Let the beacon's moving bar advance, then RE-ARM for the second capture (gate-only).
-                await Task.Delay(InterCaptureDelayMs);
-                browserWrapper.ReArmCapture();
-
-                // ── CAPTURE 2 ──────────────────────────────────────────────────────────────────────────
-                if (await Task.WhenAny(browserWrapper.PaintCaptured, timeoutTask) != browserWrapper.PaintCaptured)
-                {
-                    Console.WriteLine("BEACON-DAMAGE FAIL: no second non-blank OnPaint captured within timeout (alpha-0 mutation may not be generating fresh damage — see A4 fallback)");
-                    Log.Error("BEACON-DAMAGE FAIL — no second non-blank OnPaint within {Timeout}s (possible damage-gating swallow).", GateTimeoutSeconds);
-                    return;
-                }
-
-                var buf2 = browserWrapper.CapturedBuffer;
-                var w2 = browserWrapper.CapturedWidth;
-                var h2 = browserWrapper.CapturedHeight;
-                if (buf2 is null || w2 <= 0 || h2 <= 0)
-                {
-                    Console.WriteLine("BEACON-DAMAGE FAIL: second captured buffer null/empty");
-                    Log.Error("BEACON-DAMAGE FAIL — second capture null/empty (w={W} h={H}).", w2, h2);
-                    return;
-                }
-
-                // ── ASSERT: beacon-region RGB DIFFERS between the two captures ───────────────────────────
-                var sum1 = SumBeaconRgb(buf1, w1, h1);
-                var sum2 = SumBeaconRgb(buf2, w2, h2);
-                var delta = Math.Abs(sum1 - sum2);
 
                 Log.Information(
-                    "BEACON-DAMAGE samples — capture1 beaconRgbSum={Sum1} capture2 beaconRgbSum={Sum2} delta={Delta} (bound={Bound})",
-                    sum1, sum2, delta, DiffBound);
+                    "BEACON-DAMAGE samples over window — total={Total} present={Present} ticking={Ticking} frozen={Frozen} absentBeforeWindow={Absent} (min-ticking={Min})",
+                    total, present, ticking, frozen, absent, MinTickingSamples);
 
-                if (delta >= DiffBound)
+                if (present == 0)
+                {
+                    Console.WriteLine("BEACON-DAMAGE FAIL: no present beacon samples inside the window (content rendered then vanished, or sampler starved)");
+                    Log.Error("BEACON-DAMAGE FAIL — zero present samples in-window (unexpected after first-present gate).");
+                    return;
+                }
+
+                if (ticking >= MinTickingSamples)
                 {
                     Log.Information(
-                        "BEACON-DAMAGE OK — alpha-0 RGB mutation PRODUCED captured OnPaint damage (delta={Delta} ≥ {Bound}). " +
-                        "A4 HOLDS: the D-13 alpha-0 liveness beacon is valid (its changing pre-key RGB reaches the straight buffer the FrameMonitor samples).",
-                        delta, DiffBound);
-                    Console.WriteLine($"BEACON-DAMAGE OK: alpha-0 RGB mutation produced captured damage (delta={delta})");
+                        "BEACON-DAMAGE OK — the production FrameMonitor classified the alpha-0 beacon as TICKING on {Ticking} of {Total} in-window samples (≥ {Min}). " +
+                        "A4 HOLDS: the alpha-0 per-tick RGB mutation reaches the straight OnPaint buffer the FrameMonitor samples ⇒ the D-13 alpha-0 liveness beacon is valid on the real detection path.",
+                        ticking, total, MinTickingSamples);
+                    Console.WriteLine($"BEACON-DAMAGE OK: production beacon-state ticked {ticking}/{total} in-window samples (alpha-0 RGB mutation reaches the captured straight buffer)");
                     exitCode = 0;
                 }
                 else
                 {
                     Log.Warning(
-                        "BEACON-DAMAGE FAIL — alpha-0 RGB mutation did NOT produce captured OnPaint damage (delta={Delta} < {Bound}). " +
-                        "A4 REFUTED: Chromium damage-gating (or the un-premult LUT's alpha-0 handling) swallowed the alpha-0 mutation. " +
-                        "FALLBACK: use a LOW-ALPHA (A=1) keyed-out beacon (a barely-non-zero alpha forces a real composite while still keying out on air), OR revisit the beacon placement.",
-                        delta, DiffBound);
-                    Console.WriteLine($"BEACON-DAMAGE FAIL: beacon-region RGB identical between captures (delta={delta}) — alpha-0 damage swallowed; use the A=1 low-alpha fallback");
+                        "BEACON-DAMAGE FAIL — the beacon was PRESENT but NEVER (or too rarely) classified TICKING across the window " +
+                        "(ticking={Ticking} < {Min}; frozen={Frozen}, present={Present}). " +
+                        "A4 REFUTED: the alpha-0 RGB mutation did NOT produce detectable per-tick change in the captured straight buffer " +
+                        "(Chromium damage-gating, or the un-premult LUT's alpha-0 handling, swallowed it). " +
+                        "FALLBACK: use a LOW-ALPHA (A=1) keyed-out beacon — a barely-non-zero alpha forces a real composite while still keying out on air.",
+                        ticking, MinTickingSamples, frozen, present);
+                    Console.WriteLine($"BEACON-DAMAGE FAIL: beacon present but never ticked (ticking={ticking}/{total}, frozen={frozen}) — alpha-0 damage swallowed; use the A=1 low-alpha fallback");
                 }
             });
         }
@@ -1263,6 +1291,7 @@ public class Program
         }
         finally
         {
+            try { monitor?.Dispose(); } catch { }
             try { browserWrapper?.Dispose(); } catch { }
 
             if (Directory.Exists(launchCachePath))
