@@ -2,21 +2,22 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Beacon Alpha-0 Damage Gate Fixture (Q2 / A4)</title>
+  <title>Beacon A=1 Low-Alpha Damage Gate Fixture (Q2 / A4)</title>
   <!--
-    03-03 (Q2 / A4) ALPHA-0-DAMAGE VALIDATION FIXTURE for the --beacon-damage-check self-check.
+    03-03 (Q2 / A4) A=1 LOW-ALPHA-DAMAGE VALIDATION FIXTURE for the --beacon-damage-check self-check.
 
-    The ONE genuine empirical unknown of Phase 3 (research §19): does an alpha-0 corner whose OPAQUE RGB
-    mutates every rAF tick produce CAPTURED OnPaint damage on CefSharp 148 — surviving the un-premult LUT
-    into the straight buffer the FrameMonitor samples? If yes, the D-13 alpha-0 liveness beacon design is
-    valid (the beacon is invisible on air after the straight-alpha key, yet the monitor reads its changing
-    pre-key RGB). If no (damage-gating swallows the alpha-0 mutation, or the LUT zeroes it), the fallback is
-    a low-alpha A=1 keyed-out beacon — the gate FAILS LOUDLY pointing there.
+    A4 HISTORY (research §19): the ONE genuine empirical unknown of Phase 3 was whether an alpha-0 corner
+    whose RGB mutates every rAF tick produces CAPTURED OnPaint damage on CefSharp 148. The live Q2 gate
+    (now trustworthy) REFUTED it: the alpha-0 corner composites near-transparent and the un-premult LUT
+    amplifies it to a CONSTANT near-white (~[227,243,249]) that MASKS the per-tick RGB mutation — no
+    detectable change in the straight buffer the FrameMonitor samples. This fixture now mirrors the A4
+    fallback beacon: a UNIFORM alpha = 1/255 (≈0.4% opacity) fill with mutating RGB. At ~0.4% opacity it
+    keys out ~invisibly on air, yet a PRESENT low-alpha region's RGB is amplified by the un-premult LUT into
+    a detectable pre-key swing. The gate asserts that swing (beacon-region RGB DIFFERS between captures).
 
     LAYOUT (mirrors the production InjectHook beacon by VALUE — keep in sync):
-      - A 16x16 canvas pinned TOP-LEFT (0,0) with a TRANSPARENT (alpha-0) background but OPAQUE-RGB content
-        drawn each rAF tick (a moving bar whose R/G/B cycle). This is the beacon region the gate samples in
-        BOTH captures and asserts the RGB DIFFERS between them.
+      - A 16x16 canvas pinned TOP-LEFT (0,0) filled UNIFORMLY each rAF tick at alpha = 1/255 with RGB that
+        cycles. This is the beacon region the gate samples in BOTH captures and asserts the RGB DIFFERS.
       - A static OPAQUE content block filling the rest of the viewport so each captured frame is NON-BLANK
         (the one-shot pre-send capture skips blank frames). The static block does NOT change, isolating the
         beacon corner as the only mutating region.
@@ -34,7 +35,7 @@
       background-color: rgba(0, 128, 0, 1); /* opaque green — keeps the frame non-blank, never mutates */
       z-index: 0;
     }
-    /* The alpha-0 beacon canvas, top-left corner, real captured pixels. */
+    /* The A=1 low-alpha beacon canvas, top-left corner, real captured pixels. */
     #beacon {
       position: fixed; left: 0; top: 0; width: 16px; height: 16px;
       margin: 0; padding: 0; pointer-events: none; background: transparent;
@@ -46,8 +47,8 @@
   <div id="content"></div>
   <canvas id="beacon" width="16" height="16"></canvas>
   <script>
-    // The alpha-0 beacon: clear to transparent each tick, then draw an OPAQUE moving bar whose RGB cycles.
-    // Mirrors InjectHook.BuildPayload's __xpnBeaconDraw exactly (the production beacon shape).
+    // The A=1 low-alpha beacon (D-13 A4): clear, then fill the FULL 16x16 UNIFORMLY at alpha = 1/255 with
+    // RGB cycling each tick. Mirrors InjectHook.BuildPayload's __xpnBeaconDraw exactly (production shape).
     (function () {
       var c = document.getElementById('beacon');
       var ctx = c.getContext('2d');
@@ -58,9 +59,8 @@
         var r = (tick * 7) & 0xff;
         var g = (tick * 13) & 0xff;
         var b = (tick * 29) & 0xff;
-        ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',1)';
-        var x = tick % 16;
-        ctx.fillRect(0, 0, x + 1, 16);
+        ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (1 / 255) + ')';
+        ctx.fillRect(0, 0, 16, 16);
         window.requestAnimationFrame(draw);
       }
       window.requestAnimationFrame(draw);

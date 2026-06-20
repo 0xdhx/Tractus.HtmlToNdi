@@ -226,8 +226,19 @@ public sealed class InjectHook : IDisposable
     /// value, not by reference — FrameMonitor is CEF-agnostic and must not import this Inject type, D-02)
     /// in <c>MonitorDefaults.BeaconSampleX/Y</c>; keep them in sync. Corner (0,0): the canvas occupies real
     /// captured pixels (NOT display:none / visibility:hidden / 0-size / off-screen — all cull the paint,
-    /// research §"Visibility gotchas"); its background is alpha-0 (keyed out on air) but it draws OPAQUE-RGB
-    /// content that MUTATES every rAF tick so Chromium damage-gating cannot optimize it away (research §16).
+    /// research §"Visibility gotchas"); it fills the FULL 16x16 with a UNIFORM low-alpha (alpha = 1/255 ≈
+    /// 0.0039) color whose RGB MUTATES every rAF tick so Chromium damage-gating cannot optimize it away
+    /// (research §16).
+    ///
+    /// <para><b>A=1 LOW-ALPHA BEACON (D-13 A4 contingency — the live Q2 gate REFUTED alpha-0 on CEF148).</b>
+    /// The original design drew OPAQUE RGB over an alpha-0 (transparent) corner. The live --beacon-damage-check
+    /// gate (research §19) proved that on CefSharp 148 the alpha-0 corner composites near-transparent and the
+    /// un-premult LUT amplifies it to a CONSTANT near-white (~[227,243,249]) that MASKS the per-tick RGB
+    /// mutation — no detectable change in the straight buffer the FrameMonitor samples. The A4 fix: fill the
+    /// region UNIFORMLY at alpha = 1/255 with mutating RGB. At ~0.4% opacity the beacon still keys out
+    /// ~invisibly on air under the XPression straight-alpha key, but a PRESENT low-alpha region's RGB is
+    /// amplified by the un-premult LUT into large (0↔255-scale) pre-key swings → the per-tick mutation becomes
+    /// DETECTABLE. Keys-out-invisible AND amplified-detectable — the property alpha-0 lacked.</para>
     /// </summary>
     private const int BeaconSizePx = 16;
 
@@ -252,17 +263,21 @@ public sealed class InjectHook : IDisposable
 
         // D-15: the BEACON stanza is composed into the payload ONLY when recipe.ExpectMotion is true — a
         // SERVER-SIDE C# branch (NOT a JS runtime check), so a static page's payload carries no beacon at
-        // all (monitor infrastructure, not per-recipe boilerplate). The canvas mutates OPAQUE-RGB pixels in
-        // the alpha-0 corner each rAF tick (D-13); the rAF loop is guarded by the distinct global
-        // window.__xpnBeaconArmed (the __xpnInjected idempotency pattern, L240-242) so the observer
-        // re-running apply() never starts a SECOND loop. NO mouse/coordinate-click primitive (D-17).
+        // all (monitor infrastructure, not per-recipe boilerplate). The canvas fills the full corner with a
+        // UNIFORM alpha=1/255 color whose RGB mutates each rAF tick (D-13 A4); the rAF loop is guarded by the
+        // distinct global window.__xpnBeaconArmed (the __xpnInjected idempotency pattern, L240-242) so the
+        // observer re-running apply() never starts a SECOND loop. NO mouse/coordinate-click primitive (D-17).
         var beaconStanza = recipe.ExpectMotion
             ? $$"""
                 // D-13 LIVENESS BEACON (expectMotion=true ONLY — composed server-side). A {{BeaconSizePx}}x{{BeaconSizePx}}
-                // fixed canvas at the top-left corner: alpha-0 background (keyed out on air; sampled PRE-key by
-                // the FrameMonitor) but OPAQUE-RGB content that MUTATES every rAF tick so Chromium damage-gating
-                // cannot optimize the pixels away (research §16). Guarded by __xpnBeaconArmed so the observer's
-                // apply() re-fire never double-arms the rAF loop (idempotency Test 1).
+                // fixed canvas at the top-left corner. A=1 LOW-ALPHA design (D-13 A4 contingency): the live Q2
+                // --beacon-damage-check gate REFUTED the original alpha-0 beacon on CefSharp 148 — the alpha-0
+                // corner composited to a CONSTANT un-premult-amplified near-white (~[227,243,249]) that masked
+                // the mutation. The fix: fill the FULL canvas UNIFORMLY at alpha = 1/255 (≈0.4% opacity) with
+                // RGB mutating each rAF tick. At ~0.4% opacity it keys out ~invisibly on air (XPression
+                // straight-alpha key), yet a PRESENT low-alpha region's RGB is amplified by the un-premult LUT
+                // into large pre-key swings the FrameMonitor samples → mutation DETECTABLE (research §16/§19).
+                // Guarded by __xpnBeaconArmed so the observer's apply() re-fire never double-arms the rAF loop.
                 function __xpnArmBeacon() {
                     if (window.__xpnBeaconArmed) { return; }
                     try {
@@ -284,8 +299,9 @@ public sealed class InjectHook : IDisposable
                             s.setProperty('padding', '0', 'important');
                             s.setProperty('pointer-events', 'none', 'important');
                             s.setProperty('z-index', '2147483647', 'important');
-                            // Background stays alpha-0 (transparent) — keyed out on air; the FILL below draws
-                            // OPAQUE RGB so the pre-key buffer carries the changing color the monitor samples.
+                            // CSS background stays transparent — the per-tick canvas FILL below paints the
+                            // load-bearing pixels (uniform alpha=1/255 RGB), which the un-premult LUT amplifies
+                            // into the changing pre-key color the monitor samples (D-13 A4; keyed out on air).
                             s.setProperty('background', 'transparent', 'important');
                             (document.body || document.documentElement).appendChild(c);
                         }
@@ -296,16 +312,17 @@ public sealed class InjectHook : IDisposable
                         function __xpnBeaconDraw() {
                             try {
                                 __xpnBeaconTick = (__xpnBeaconTick + 1) & 0xff;
-                                // Clear to alpha-0 (transparent) every tick, then draw an OPAQUE moving bar
-                                // whose RGB changes each tick — guarantees real pixel damage (NOT a static or
-                                // identically-re-rendering counter, research §16). The bar's hue + x cycle.
+                                // D-13 A4: clear, then fill the FULL canvas UNIFORMLY at alpha = 1/255 with RGB
+                                // mutating each tick. NOT alpha-0 (A4-refuted: composited to a constant near-white
+                                // that masked the mutation) and NOT alpha-1.0/a-partial-bar. The uniform low-alpha
+                                // region is PRESENT, keys out ~invisibly on air (~0.4% opacity), and the un-premult
+                                // LUT amplifies its mutating RGB into a detectable pre-key swing (research §16/§19).
                                 ctx.clearRect(0, 0, {{BeaconSizePx}}, {{BeaconSizePx}});
                                 var r = (__xpnBeaconTick * 7) & 0xff;
                                 var g = (__xpnBeaconTick * 13) & 0xff;
                                 var b = (__xpnBeaconTick * 29) & 0xff;
-                                ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',1)';
-                                var x = __xpnBeaconTick % {{BeaconSizePx}};
-                                ctx.fillRect(0, 0, x + 1, {{BeaconSizePx}});
+                                ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (1 / 255) + ')';
+                                ctx.fillRect(0, 0, {{BeaconSizePx}}, {{BeaconSizePx}});
                             } catch (e) {}
                             window.requestAnimationFrame(__xpnBeaconDraw);
                         }
