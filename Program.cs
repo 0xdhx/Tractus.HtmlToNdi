@@ -90,6 +90,27 @@ public class Program
             return; // unreachable — RunAccuWeatherProbe always calls Environment.Exit.
         }
 
+        if (args.Any(x => x.StartsWith("--accuweather-capture")))
+        {
+            // 03-04 D-07/D-24/D-26 (VAL-04): the idle-gap capture gate. Detected BEFORE --smoke
+            // (StartsWith("--smoke") would NOT alias "--accuweather-capture") and before the interactive
+            // --ndiname/--port prompts (same stdin-hang hazard). Launches the FULL live pipeline (the SAME
+            // composition root the interactive --url=/--recipe path uses — CefWrapper + FrameMonitor +
+            // FramePump + NDI send) against the AccuWeather recipe (expectMotion=true), then arms a per-sample
+            // LOGGING SIDE-CHANNEL that CONSUMES the plan-03 read-only SampleObserved telemetry seam (D-24) on
+            // the EXISTING 5 Hz OnSampleTick (SampleIntervalMs=200 — NO new timer, NO recomputed detector, NO
+            // reach into private FrameMonitor fields). Each sample → one CSV line of six columns:
+            // tMs/dHash/hammingFromPrev/lastPaintAgeMs/beaconState/targetPresent. Runs for a bounded
+            // --duration then flushes + Environment.Exit(0). The operator runs this on the GPU Session-2 host
+            // (Task 2) to derive the longest BEACON-GATED normal idle gap and lock freezeTimeoutMs ≈≥3× it.
+            // CRITICAL: NDI is wired exactly like the interactive path because CefWrapper.OnBrowserPaint
+            // early-returns at `if (Program.NdiSenderPtr == nint.Zero) return;` BEFORE FrameReady?.Invoke —
+            // FrameReady is the FrameMonitor's only frame feed, so a capture that skips NDI would STARVE the
+            // monitor and SampleObserved would produce nothing.
+            RunAccuWeatherCapture(args, launchCachePath);
+            return; // unreachable — RunAccuWeatherCapture always calls Environment.Exit.
+        }
+
         if (args.Any(x => x.StartsWith("--beacon-damage-check")))
         {
             // 03-03 (Q2 / A4): the alpha-0-damage validation gate — the ONE genuine empirical unknown of
@@ -833,6 +854,291 @@ public class Program
                 catch
                 {
                 }
+            }
+        }
+
+        Log.CloseAndFlush();
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>
+    /// 03-04 D-07/D-24/D-26 (VAL-04): the idle-gap capture gate — a LOGGING SIDE-CHANNEL on the live
+    /// pipeline used to data-drive the freeze backstop (<c>freezeTimeoutMs</c>). Unlike the one-shot
+    /// gates above, this is a LONG-RUNNING live gate: it stands up the SAME single-authority composition
+    /// root the interactive <c>--url=</c>/<c>--recipe</c> path uses — NDI sender → <see cref="CefWrapper"/>
+    /// → <see cref="FrameMonitor"/> → <see cref="FramePump"/> — against the AccuWeather recipe
+    /// (<c>expectMotion=true</c>), then logs ONE CSV line per sample tick for a bounded duration.
+    /// <para>
+    /// The capture is purely a tap on values <see cref="FrameMonitor.Classify"/> already produces, exposed
+    /// via the plan-03 read-only <see cref="FrameMonitor.SampleObserved"/> telemetry seam (D-24): NO new
+    /// timer (it rides the existing 5 Hz <c>OnSampleTick</c>, <c>SampleIntervalMs=200</c>), NO recomputed
+    /// detector, NO reach into private FrameMonitor fields. The six columns are
+    /// <c>tMs</c> (monotonic from the first sample), <c>dHash</c>, <c>hammingFromPrev</c> (all from the
+    /// snapshot), <c>lastPaintAgeMs</c> (read read-only off <see cref="FrameMonitor.SnapshotHealth"/>),
+    /// <c>beaconState</c> (the snapshot's 3-state liveness — ground truth; analysis gates the idle-gap on
+    /// <c>beaconState=true</c>), and <c>targetPresent</c> (read via the SAME sibling-probe
+    /// <see cref="ReadMainBoolAsync"/> of <c>window.__xpnTargetPresent</c> the <c>/health</c> path uses —
+    /// NOT a FrameMonitor field; FrameMonitor stays IFrameSource-only, D-24).
+    /// </para>
+    /// <para>
+    /// CRITICAL: NDI is wired exactly like the interactive path. <see cref="CefWrapper"/>'s
+    /// <c>OnBrowserPaint</c> early-returns at <c>if (Program.NdiSenderPtr == nint.Zero) return;</c> BEFORE
+    /// raising <c>FrameReady</c>, which is the monitor's ONLY frame feed — a capture that skips NDI would
+    /// starve the monitor and produce an empty log. Runs for <c>--duration</c> seconds then flushes the log
+    /// + <see cref="Environment.Exit"/>(0). Bounded + self-exiting (the operator runs it under a timeout).
+    /// </para>
+    /// </summary>
+    private static void RunAccuWeatherCapture(string[] args, string launchCachePath)
+    {
+        var width = 1920;
+        var height = 1080;
+        const int DefaultDurationSeconds = 300;
+
+        // ── arg parsing ───────────────────────────────────────────────────────────────────────────
+        // --recipe=<path-or-name> (mirrors the normal path's --recipe; NOT aliasing --recipe-dir).
+        string? recipeName = null;
+        var recipeArg = args.FirstOrDefault(x => x.StartsWith("--recipe") && !x.StartsWith("--recipe-dir"));
+        if (recipeArg is not null)
+        {
+            var eqR = recipeArg.IndexOf('=');
+            if (eqR >= 0 && eqR < recipeArg.Length - 1)
+            {
+                recipeName = recipeArg.Substring(eqR + 1);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(recipeName))
+        {
+            Console.WriteLine("ACCUWEATHER-CAPTURE FAIL: --recipe=<path-to-accuweather.json> is required.");
+            Log.Error("ACCUWEATHER-CAPTURE FAIL — missing --recipe.");
+            Log.CloseAndFlush();
+            Environment.Exit(1);
+        }
+
+        // --duration=<seconds> (default 300 = 5 min); bounded + self-exiting.
+        var durationSeconds = DefaultDurationSeconds;
+        var durationArg = args.FirstOrDefault(x => x.StartsWith("--duration"));
+        if (durationArg is not null)
+        {
+            var eqD = durationArg.IndexOf('=');
+            if (eqD < 0 || !int.TryParse(durationArg.Substring(eqD + 1), out durationSeconds) || durationSeconds <= 0)
+            {
+                Console.WriteLine("ACCUWEATHER-CAPTURE FAIL: --duration must be a positive integer (seconds).");
+                Log.Error("ACCUWEATHER-CAPTURE FAIL — bad --duration.");
+                Log.CloseAndFlush();
+                Environment.Exit(1);
+            }
+        }
+
+        // --out=<path> override; default to a Windows-local path the operator (and WSL via /mnt/c) can
+        // retrieve. The dir is created if absent.
+        string outPath;
+        var outArg = args.FirstOrDefault(x => x.StartsWith("--out"));
+        if (outArg is not null && outArg.IndexOf('=') is var eqO && eqO >= 0 && eqO < outArg.Length - 1)
+        {
+            outPath = outArg.Substring(eqO + 1);
+        }
+        else
+        {
+            var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            outPath = Path.Combine(@"C:\temp", $"accuweather-capture-{stamp}.csv");
+        }
+
+        // Resolve the recipe SYNCHRONOUSLY before Cef.Initialize — its ExpectsCrossOriginIframes gates the
+        // site-isolation CefCommandLineArgs (Pitfall 4: late adds are silently ignored), exactly as the
+        // normal path does. An explicit recipe that fails validation is a HARD failure (D-20).
+        var recipeDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "recipes");
+        var store = new RecipeStore(new RecipeValidator());
+        var recipePath = Path.IsPathRooted(recipeName)
+            ? recipeName
+            : Path.Combine(recipeDir, recipeName!.EndsWith(".json") ? recipeName! : recipeName! + ".json");
+        if (!store.TryLoadExplicit(recipePath, out var recipe, out var recipeError) || recipe is null)
+        {
+            Console.WriteLine($"ACCUWEATHER-CAPTURE FAIL: recipe failed to load: {recipeError}");
+            Log.Error("ACCUWEATHER-CAPTURE FAIL — recipe load: {Error}", recipeError);
+            Log.CloseAndFlush();
+            Environment.Exit(1);
+        }
+
+        var startUrl = recipe!.UrlMatch ?? "https://www.accuweather.com/";
+        Log.Information(
+            "ACCUWEATHER-CAPTURE starting — recipe={Recipe} expectMotion={Motion} duration={Duration}s out={Out}",
+            recipePath, recipe.ExpectMotion, durationSeconds, outPath);
+
+        var exitCode = 1; // default failure; set 0 on a clean bounded run.
+
+        try
+        {
+            // Open the log + write the header up front so the path is valid before CEF spins up.
+            var outDir = Path.GetDirectoryName(outPath);
+            if (!string.IsNullOrEmpty(outDir) && !Directory.Exists(outDir))
+            {
+                Directory.CreateDirectory(outDir);
+            }
+
+            using var logWriter = new StreamWriter(outPath, append: false) { AutoFlush = false };
+            logWriter.WriteLine("tMs,dHash,hammingFromPrev,lastPaintAgeMs,beaconState,targetPresent");
+            logWriter.Flush();
+            Console.WriteLine($"ACCUWEATHER-CAPTURE log: {outPath}");
+
+            var sampleCount = 0L;
+            var firstSampleTicks = -1L; // monotonic origin (first sample's snapshot Ts), for tMs.
+
+            AsyncContext.Run(async delegate
+            {
+                var settings = new CefSettings();
+                if (!Directory.Exists(launchCachePath))
+                {
+                    Directory.CreateDirectory(launchCachePath);
+                }
+
+                settings.RootCachePath = launchCachePath;
+                settings.CefCommandLineArgs.Add("autoplay-policy", "no-user-gesture-required");
+
+                // D-13 anti-throttle — kept in sync with the smoke/normal/gate paths (unconditional) so a
+                // backgrounded/occluded offscreen surface does not throttle rAF / timers during the capture.
+                settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+                settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+                settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+
+                // D-03/D-21: site-isolation flags — recipe-gated, BEFORE Cef.Initialize (same as the
+                // normal path). AccuWeather is expectsCrossOriginIframes=false, so these stay off here.
+                if (recipe.ExpectsCrossOriginIframes)
+                {
+                    settings.CefCommandLineArgs.Add("disable-features", "IsolateOrigins,site-per-process");
+                    settings.CefCommandLineArgs.Add("disable-site-isolation-trials", "1");
+                }
+
+                settings.EnableAudio();
+                Cef.Initialize(settings);
+                AppManagement.LogProvenance();
+
+                // ── THE NDI SENDER — wired exactly like the interactive path (see the CRITICAL note in the
+                // method summary). Without a non-Zero NdiSenderPtr, OnBrowserPaint never raises FrameReady,
+                // so the FrameMonitor never samples and the capture is empty. Created BEFORE the wrapper so
+                // the pump can be constructed with a valid sender ptr.
+                var settings_T = new NDIlib.send_create_t
+                {
+                    p_ndi_name = UTF.StringToUtf8("XPRESSION-CAPTURE"),
+                };
+                Program.NdiSenderPtr = NDIlib.send_create(ref settings_T);
+                if (Program.NdiSenderPtr == nint.Zero)
+                {
+                    Log.Error("ACCUWEATHER-CAPTURE FAIL — NDIlib.send_create returned nint.Zero (NDI native DLL missing/wrong).");
+                    return; // exitCode stays 1
+                }
+
+                browserWrapper = new CefWrapper(width, height, startUrl)
+                {
+                    StartupRecipe = recipe, // D-16: registered in InitializeWrapperAsync BEFORE Load.
+                };
+
+                // THE SAME single-authority composition root as the interactive/smoke path: source → monitor
+                // → pump. FrameMonitor subscribes to browserWrapper.FrameReady; FramePump is the sole NDI
+                // sender, pulling on its own cadence so NDI never stops. No refresh delegate is wired (the
+                // capture only OBSERVES; we do not want a recovery refresh perturbing the idle-gap corpus).
+                var monitor = new FrameMonitor(browserWrapper);
+                var pump = new FramePump(monitor, Program.NdiSenderPtr);
+                pump.Start();
+
+                // ── THE LOGGING SIDE-CHANNEL (D-24): consume the read-only SampleObserved seam on the
+                // EXISTING 5 Hz tick. NO new timer, NO recompute. dHash/hammingFromPrev/beaconState come
+                // straight off the snapshot; lastPaintAgeMs is read read-only off SnapshotHealth (the same
+                // value /health reports); targetPresent is read via the /health sibling probe of
+                // window.__xpnTargetPresent — NOT a FrameMonitor field. The handler MUST NOT mutate monitor
+                // state (the seam is observability-only).
+                monitor.SampleObserved += snap =>
+                {
+                    if (Interlocked.CompareExchange(ref firstSampleTicks, snap.Ts.Ticks, -1L) == -1L)
+                    {
+                        // first sample established the monotonic origin.
+                    }
+
+                    var originTicks = Interlocked.Read(ref firstSampleTicks);
+                    var tMs = (long)TimeSpan.FromTicks(snap.Ts.Ticks - originTicks).TotalMilliseconds;
+
+                    // lastPaintAgeMs off the read-only health snapshot (no side effects — D-24/D-25).
+                    var lastPaintAgeMs = (long)monitor.SnapshotHealth().LastPaintAgeMs;
+
+                    // beaconState token: "true" (alive/ticking) gates the idle-gap analysis in Task 2.
+                    var beaconState = snap.BeaconState switch
+                    {
+                        BeaconLiveness.True => "true",
+                        BeaconLiveness.False => "false",
+                        _ => "absent",
+                    };
+
+                    // targetPresent via the SAME sibling probe /health uses — confirms the capture is of the
+                    // RIGHT content (not a drifted recipe). Read-only; null on a read miss → "" in the CSV.
+                    bool? targetPresent;
+                    try
+                    {
+                        targetPresent = ReadMainBoolAsync(browserWrapper, "__xpnTargetPresent")
+                            .GetAwaiter().GetResult();
+                    }
+                    catch
+                    {
+                        targetPresent = null;
+                    }
+
+                    var targetCol = targetPresent.HasValue ? (targetPresent.Value ? "true" : "false") : "";
+
+                    // Write under a lock — SampleObserved fires off the timer thread; AutoFlush is off so a
+                    // periodic flush keeps the file readable mid-run without thrashing.
+                    lock (logWriter)
+                    {
+                        logWriter.WriteLine(
+                            $"{tMs},{snap.DHash},{snap.HammingFromPrev},{lastPaintAgeMs},{beaconState},{targetCol}");
+                        var n = Interlocked.Increment(ref sampleCount);
+                        if (n % 25 == 0) // ≈ every 5 s at 5 Hz.
+                        {
+                            logWriter.Flush();
+                        }
+                    }
+                };
+
+                await browserWrapper.InitializeWrapperAsync();
+
+                // Apply the recipe timing/expectMotion to the state machine, then start the existing 5 Hz
+                // sampler (the SampleObserved tap is already subscribed above). No fallback frame / no swap
+                // wiring — the capture only observes; it never drives fallback.
+                monitor.ApplyRecipe(recipe);
+                monitor.StartSampling();
+
+                // Bounded run — sleep the duration, then tear down cleanly. Self-exiting (the operator runs
+                // this under a timeout; this is the primary exit path).
+                await Task.Delay(TimeSpan.FromSeconds(durationSeconds));
+
+                await pump.StopAsync();
+                monitor.Dispose(); // stops the 5 Hz timer + unsubscribes FrameReady before wrapper teardown.
+
+                lock (logWriter)
+                {
+                    logWriter.Flush();
+                }
+
+                exitCode = 0;
+            });
+
+            // Final flush + summary AFTER AsyncContext.Run returns (the using-disposed writer is flushed on
+            // dispose, but emit the line count + path for the operator/orchestrator either way).
+            var total = Interlocked.Read(ref sampleCount);
+            logWriter.Flush();
+            Console.WriteLine($"ACCUWEATHER-CAPTURE done — {total} samples written to {outPath}");
+            Log.Information("ACCUWEATHER-CAPTURE done — samples={Count} out={Out}", total, outPath);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("ACCUWEATHER-CAPTURE FAIL — exception during capture: {@ex}", ex);
+            exitCode = 1;
+        }
+        finally
+        {
+            try { browserWrapper?.Dispose(); } catch { }
+
+            if (Directory.Exists(launchCachePath))
+            {
+                try { Directory.Delete(launchCachePath, true); } catch { }
             }
         }
 
