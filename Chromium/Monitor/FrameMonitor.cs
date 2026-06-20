@@ -20,7 +20,11 @@ namespace Tractus.HtmlToNdi.Chromium.Monitor;
 ///   <item><see cref="RecoveryExhausted"/> — N refresh attempts exhausted with no recovery; fallback is
 ///   HELD, refreshing STOPS, the watchdog (Phase 4) reads this (D-13).</item>
 /// </list>
+/// <para>D-32: serialized in the <c>/health</c> contract as KEBAB-LOWER STRING tokens (e.g.
+/// <c>"recovery-exhausted"</c>, <c>"recovering"</c>) via <see cref="KebabCaseStringEnumConverter"/> — never
+/// the System.Text.Json numeric default. The watchdog reads the string, not an integer.</para>
 /// </remarks>
+[System.Text.Json.Serialization.JsonConverter(typeof(KebabCaseStringEnumConverter))]
 public enum MonitorStatus
 {
     /// <summary>On air live; fresh changing frames, recent paint.</summary>
@@ -311,6 +315,98 @@ public sealed class FrameMonitor : IDisposable
 
     /// <summary>Snapshot of the transition log (Pitfall P-4 — every change recorded with its reason).</summary>
     public IReadOnlyList<string> TransitionLog { get { lock (this.stateLock) { return this.transitionLog.ToArray(); } } }
+
+    // ── D-23/D-27 /health context: the CROSS-COMPONENT fields the snapshot reports that the monitor does
+    // NOT own (the pump's FramesSent, the process start, the current recipe urlMatch summary, the P1
+    // isolation posture string, the Plan-04 fallback asset state). The composition root wires these via
+    // WireHealth(...) so SnapshotHealth() stays PARAMETERLESS (D-27 closes over the monitor local directly,
+    // `() => monitor.SnapshotHealth()`). FrameMonitor stays CEF-agnostic — these are plain delegates/values,
+    // no render-engine type. Until wired, the snapshot reports safe defaults (0 frames / posture "unknown").
+    private Func<long>? framesSentSupplier;
+    private Func<string?>? recipeUrlMatchSupplier;
+    private Func<FallbackAssetState>? fallbackAssetStateSupplier;
+    private string isolationPosture = "unknown";
+    private DateTime processStartTs;
+
+    /// <summary>
+    /// D-23/D-27: wire the cross-component <c>/health</c> fields the monitor does not own. Called once at the
+    /// composition root after the pump + fallback provider are constructed. <paramref name="framesSent"/> is
+    /// the pump's running counter, <paramref name="recipeUrlMatch"/> a no-secret recipe summary supplier,
+    /// <paramref name="fallbackAssetState"/> the Plan-04 configured-vs-generated-default supplier,
+    /// <paramref name="isolationPosture"/> the P1 D-03 startup posture string (e.g. <c>"OFF"</c>/<c>"ON"</c>),
+    /// and <paramref name="processStart"/> the process start used for <c>uptimeSec</c>. No CEF type crosses
+    /// this seam — all plain values/delegates (the CEF-agnostic boundary holds).
+    /// </summary>
+    public void WireHealth(
+        Func<long> framesSent,
+        Func<string?> recipeUrlMatch,
+        Func<FallbackAssetState> fallbackAssetState,
+        string isolationPosture,
+        DateTime processStart)
+    {
+        lock (this.stateLock)
+        {
+            this.framesSentSupplier = framesSent;
+            this.recipeUrlMatchSupplier = recipeUrlMatch;
+            this.fallbackAssetStateSupplier = fallbackAssetState;
+            this.isolationPosture = isolationPosture;
+            this.processStartTs = processStart;
+        }
+    }
+
+    /// <summary>
+    /// D-23/D-24 (read-only, NO side effects): build the rich <c>/health</c> snapshot. Pure MAPPING — every
+    /// field already lives in the monitor / wired suppliers after Plans 02/04/05 (not new instrumentation).
+    /// The status/source enums serialize as STRING tokens (D-32). <see cref="LastPaintAgeMs"/> climbs high on
+    /// a freeze while the process still answers 200, so a freeze never looks dead (D-24 — the watchdog infers
+    /// death only from a connection failure, never from a field here).
+    /// </summary>
+    public HealthSnapshot SnapshotHealth()
+    {
+        var now = this.clock();
+
+        // D-24 freeze-vs-dead: lastPaintAgeMs is the age of the last SOURCE PAINT (source.LastPaint), the same
+        // clock the cadence check uses and the true wedged-renderer signal — a wedged renderer never advances
+        // LastPaint, so this climbs high on a freeze while the process still answers 200. Using the source paint
+        // clock (not the wall-clock copy stamp) keeps it consistent with the injected `now` for determinism AND
+        // is the real liveness signal (the copy stamp can lag/lead the injected clock). Never-painted ⇒ +∞.
+        var lastPaint = this.source.LastPaint;
+        var lastPaintAgeMs = lastPaint == DateTime.MinValue
+            ? double.PositiveInfinity
+            : (now - lastPaint).TotalMilliseconds;
+
+        lock (this.stateLock)
+        {
+            var refreshTs = this.lastRefreshTs == DateTime.MinValue ? (DateTime?)null : this.lastRefreshTs;
+
+            // lastGoodFrameAgeMs (02-05 semantics): ms since the last GOOD live frame — the source paint age,
+            // same basis as lastPaintAgeMs here (both are the cadence age the watchdog reads).
+            var lastGoodAgeMs = lastPaintAgeMs;
+
+            return new HealthSnapshot
+            {
+                Status = this.status,
+                Source = this.outputState == 0 ? FrameSource.Live : FrameSource.Fallback,
+                LastPaintAgeMs = lastPaintAgeMs,
+                FramesSent = this.framesSentSupplier?.Invoke() ?? 0,
+                UptimeSec = this.processStartTs == DateTime.MinValue
+                    ? 0
+                    : Math.Max(0, (now - this.processStartTs).TotalSeconds),
+                RecipeUrlMatch = this.recipeUrlMatchSupplier?.Invoke(),
+                IsolationPosture = this.isolationPosture,
+                FallbackAsset = this.fallbackAssetStateSupplier?.Invoke() ?? FallbackAssetState.GeneratedDefault,
+                RecoveryAttempts = this.recoveryAttempts,
+                LastRefreshTs = refreshTs,
+                LastGoodFrameAgeMs = lastGoodAgeMs,
+                FallbackReason = string.IsNullOrEmpty(this.fallbackReason) ? null : this.fallbackReason,
+                LastTransition = new HealthSnapshot.TransitionInfo
+                {
+                    Ts = this.lastTransitionTs,
+                    Reason = this.lastTransitionReason,
+                },
+            };
+        }
+    }
 
     /// <summary>
     /// Apply a recipe's timing/hysteresis knobs (Plan 04 fields) + <c>expectMotion</c> gate to the state

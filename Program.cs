@@ -405,6 +405,21 @@ public class Program
         };
         monitor.StartSampling();
 
+        // 02-06 (D-23/D-27): wire the CROSS-COMPONENT /health fields the monitor does not own — the pump's
+        // FramesSent counter, a no-secret recipe urlMatch summary (CurrentRecipe.UrlMatch only — NOT the full
+        // sensitive URL, T-2-06-1), the Plan-04 configured-vs-generated-default fallback asset state, the P1
+        // D-03 startup isolation posture string (OFF/ON, same value the POSTURE log emitted above), and the
+        // process start for uptimeSec. SnapshotHealth() then closes over the `monitor` local with NO args
+        // (D-27 — no browserWrapper.Monitor accessor). All plain values/delegates: the CEF-agnostic seam holds.
+        var isolationPostureStr = launchExpectsCrossOriginIframes ? "OFF" : "ON";
+        var healthProcessStart = System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime();
+        monitor.WireHealth(
+            () => pump.FramesSent,
+            () => browserWrapper.CurrentRecipe?.UrlMatch,
+            () => fallbackAssetState,
+            isolationPostureStr,
+            healthProcessStart);
+
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
         var capabilitiesPtr = UTF.StringToUtf8(capabilitiesXml);
@@ -576,6 +591,19 @@ public class Program
         {
             browserWrapper.RefreshPage();
         }).WithOpenApi();
+
+        // 02-06 (D-23/D-24/D-25/D-27/D-32 — MON-05): the rich READ-ONLY liveness contract. A GET with NO
+        // input + NO side effects (D-25 — it cannot mutate monitor or render state, T-2-06-3), mapped here
+        // BEFORE app.Run() mirroring the /recipe GET above. It closes over the composition-root-local
+        // `monitor` DIRECTLY (D-27 — there is deliberately NO browserWrapper.Monitor / CefWrapper.Monitor
+        // accessor); SnapshotHealth() maps the already-instrumented monitor/pump/fallback/posture state.
+        // D-24 freeze-vs-dead: a running-but-frozen process answers 200 here with status=tripped/recovering
+        // + a high lastPaintAgeMs; a DEAD process simply fails to connect, so the deferred Phase-4 watchdog
+        // distinguishes the two without a re-instrumentation pass — and never needlessly restarts a
+        // recovering process. D-32: status/source serialize as STRING tokens (recovery-exhausted/fallback),
+        // never integers (the KebabCaseStringEnumConverter on the enums), so the watchdog reads the contract.
+        app.MapGet("/health", () => monitor.SnapshotHealth())
+            .WithOpenApi();
 
         app.Run();
 
