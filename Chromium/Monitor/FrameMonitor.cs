@@ -257,6 +257,20 @@ public sealed class FrameMonitor : IDisposable
     private bool beaconPrevPresent;          // whether the prior tick saw a present (non-absent) beacon.
     private BeaconLiveness beaconState = BeaconLiveness.Absent; // the 3-state surfaced on /health.
 
+    // 03-05 (D-31): the BEACON-TRIP-AUTHORITY flag. VAL-04's v1.0 trip authority is the freezeTimeoutMs
+    // BACKSTOP (D-26, validated by 03-04's idle-gap capture); the liveness beacon is BEST-EFFORT. 03-04 found
+    // the beacon reads False 78/299 while a HEALTHY radar runs, and a False beacon (while expectMotion) feeds
+    // the K-in trip counter (D-25, the `beacon-frozen` branch in Classify below) — so an unreliable beacon
+    // could FALSE-TRIP the slate over a healthy radar. When this flag is FALSE the `beacon-frozen` branch is
+    // SUPPRESSED (the beacon no longer feeds the trip counter), while UpdateBeaconState still runs and
+    // BeaconAlive/beaconState STAYS surfaced on /health as pure telemetry (the flag gates ONLY the
+    // trip-feed, never the telemetry). The dHash+paint-age backstop is then the sole freeze-trip path. The
+    // --accuweather-validate gate (Program.cs) honors the D-31 DISABLE-ON-FALSE-TRIP guard: if the beacon
+    // false-trips over the real idle-hold it sets this OFF and re-validates the system holds on the backstop
+    // ALONE. Default TRUE so the beacon stays a best-effort fast-trip bonus unless a false-trip is observed;
+    // deep A4 beacon re-validation is backlog (2026-06-20-beacon-a4-validation-gate-render-robustness.md).
+    private volatile bool beaconTripEnabled = true;
+
     // ── 03-03 (D-24) read-only SampleObserved telemetry-out seam ──
     // Plan 04's D-07 capture + the BeaconClassify tests observe the monitor's per-sample internal decision
     // values (dHash / hamming-from-prev / beacon-state) WITHOUT widening the private Classify visibility.
@@ -333,6 +347,21 @@ public sealed class FrameMonitor : IDisposable
 
     /// <summary>Which signal tripped the current fallback (cadence / freeze / blank-reason), for /health.</summary>
     public string FallbackReason { get { lock (this.stateLock) { return this.fallbackReason; } } }
+
+    /// <summary>
+    /// 03-05 (D-31): the beacon-trip-authority gate. When <c>true</c> (default) a FROZEN beacon while
+    /// motion is expected feeds the K-in trip counter as the best-effort fast-trip signal; when <c>false</c>
+    /// the <c>beacon-frozen</c> branch in <see cref="Classify"/> is SUPPRESSED and the freezeTimeoutMs
+    /// backstop is the sole freeze-trip authority (D-26). Either way the beacon keeps ticking and
+    /// <see cref="HealthSnapshot.BeaconAlive"/> stays surfaced on <c>/health</c> as telemetry — this flag
+    /// gates ONLY the trip-feed, never the observability. The <c>--accuweather-validate</c> gate sets this
+    /// OFF if the beacon false-trips over the radar's real idle-hold (the D-31 disable-on-false-trip guard).
+    /// </summary>
+    public bool BeaconTripEnabled
+    {
+        get => this.beaconTripEnabled;
+        set => this.beaconTripEnabled = value;
+    }
 
     /// <summary>The most recent state transition + its triggering reason (Pitfall P-4, for /health).</summary>
     public (DateTime Ts, string Reason) LastTransition
@@ -656,7 +685,11 @@ public sealed class FrameMonitor : IDisposable
         // immediately" (D-13) means it skips only the freezeTimeoutMs BACKSTOP wait: at 5Hz with Kin~3 the
         // flip is sub-second (D-08). An ABSENT beacon (never injected/armed) is NOT a trip — it degrades to
         // the dHash + paint-age backstop below (D-13: "beacon absent" NEVER trips a false freeze).
-        if (this.expectMotion && this.beaconState == BeaconLiveness.False)
+        // 03-05 (D-31): gated by beaconTripEnabled. UpdateBeaconState above ALREADY ran, so beaconState (and
+        // thus the /health BeaconAlive telemetry) is current regardless of this flag — the flag SUPPRESSES
+        // only the trip FEED. When OFF, a False beacon over a healthy radar (03-04: 78/299 false reads) can no
+        // longer false-trip the slate; the freezeTimeoutMs backstop below stays the sole freeze authority.
+        if (this.beaconTripEnabled && this.expectMotion && this.beaconState == BeaconLiveness.False)
         {
             return (true, "beacon-frozen");
         }
