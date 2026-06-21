@@ -240,10 +240,26 @@ public sealed class FrameMonitor : IDisposable
     private string lastTransitionReason = string.Empty;
     private bool refreshInFlight; // single-flight latch across the await of refreshDelegate (D-13).
 
-    // The dHash freeze window — the most recent FreezeWindowSize hashes (D-07).
+    // The dHash freeze window — the most recent FreezeWindowSize hashes (D-07). Retained as warm telemetry
+    // and for the legacy whole-window-identical helper; it is NO LONGER the freeze-trip authority (VAL-04).
     private readonly ulong[] hashRing = new ulong[FreezeWindowSize];
     private int hashRingCount;
     private int hashRingNext;
+
+    // ── 03-05 (VAL-04 fix) CONTENT-STALENESS TIMER — the beacon-INDEPENDENT freeze authority ──
+    // The original freeze-dhash trip fired the moment the 5-sample dHash ring was all-identical (=1.0s at
+    // 5Hz) UNLESS beaconState==True. Live data (03-05) falsified that: a HEALTHY self-throttling radar holds
+    // each loop frame 3.6s (17.8s elsewhere) — far longer than the 1.0s window — and its injected beacon is
+    // only ~57% reliable, so a legitimate idle-hold coinciding with a not-True beacon FALSE-TRIPPED the slate
+    // (reason=freeze-dhash). The fix: track the wall time of the last CONTENT change (a dHash that moved more
+    // than FreezeHammingBound from the prior sample) and trip "freeze-dhash" ONLY when content has been static
+    // for longer than freezeTimeoutMs — beacon-INDEPENDENT. freezeTimeoutMs (60s in the AccuWeather recipe) is
+    // ≥3× the worst-case legitimate idle gap, so an idle-hold never trips while a genuine all-stop freeze
+    // (content static for minutes) still does. The beacon-frozen branch stays as a best-effort FAST trip while
+    // BeaconTripEnabled; the beacon remains /health telemetry regardless of this timer.
+    private DateTime lastDHashChangeTs = DateTime.MinValue; // wall time of the most recent CONTENT dHash change.
+    private ulong staleBaselineDHash;                        // the dHash the staleness window is measured against.
+    private bool hasStaleBaseline;                           // whether a baseline dHash has been established.
 
     // ── 03-03 (D-13/D-24) LIVENESS-BEACON sampling state (monitor-owned, pixel-sampled) ──
     // The injected beacon (InjectHook) draws an OPAQUE-RGB bar mutating each rAF tick over an alpha-0
@@ -694,28 +710,51 @@ public sealed class FrameMonitor : IDisposable
             return (true, "beacon-frozen");
         }
 
-        // 03-03 (D-13) IDLE-HOLD: a TICKING beacon is positive proof the render/capture pipeline is alive,
-        // so a static whole-frame dHash is a legitimate idle-hold (the radar's self-throttled gap between
-        // loop iterations), NOT a freeze — STAY ON AIR. This is the VAL-04 crux: a self-throttling isolated
-        // radar's long idle-hold and a genuine freeze are pixel-identical to a whole-frame dHash, so the
-        // beacon (which WE control) disambiguates them. When the beacon is ticking we therefore SUPPRESS the
-        // dHash freeze backstop (but keep the ring fed so it is warm if the beacon later goes absent). The
-        // dHash + paint-age backstop below is the ONLY freeze trip path when the beacon is ABSENT (D-13).
+        // 03-05 (VAL-04 fix) CONTENT-STALENESS TIMER — the beacon-INDEPENDENT freeze authority.
+        //
+        // The VAL-04 crux: a self-throttling isolated radar's long legitimate idle-hold (content held 3.6s,
+        // up to 17.8s, between loop iterations) and a genuine all-stop freeze are PIXEL-IDENTICAL to a
+        // whole-frame dHash. The original code used a fixed 5-sample (1.0s) window and relied on a TICKING
+        // beacon to suppress false trips — but the injected beacon is only ~57% reliable over a HEALTHY radar
+        // (03-05 capture), so a ≥1s idle gap coinciding with a not-True beacon false-tripped the slate.
+        //
+        // The fix disambiguates by TIME, not by the beacon: track the wall time of the last CONTENT change
+        // (a dHash that moved more than FreezeHammingBound) and trip ONLY when content has been static for
+        // longer than freezeTimeoutMs (60s in the AccuWeather recipe — ≥3× the worst-case 17.8s legitimate
+        // idle gap). An idle-hold of seconds therefore NEVER trips; a genuine freeze (content static for
+        // minutes) still does. This path is BEACON-INDEPENDENT: a False/Absent/True beacon does not change the
+        // verdict (the beacon-frozen branch above already handles the best-effort FAST trip while enabled, and
+        // the beacon stays /health telemetry regardless). The dHash ring is kept warm for telemetry.
         if (snapshot is not null && this.expectMotion)
         {
             this.PushHash(this.lastSampleDHash);
-            if (this.beaconState != BeaconLiveness.True && this.HashWindowFrozen())
+
+            // Establish / advance the content-staleness baseline. A dHash that has moved more than the global
+            // freeze Hamming bound is a genuine CONTENT change — reset the staleness window to now. Otherwise
+            // the content is unchanged and the window keeps aging toward freezeTimeoutMs.
+            if (!this.hasStaleBaseline)
             {
-                // Beacon ABSENT (or not yet established) AND the whole-frame dHash window is frozen → the
-                // backstop trips. A TICKING beacon short-circuits this (idle-hold). A FROZEN beacon already
-                // returned "beacon-frozen" above (the faster signal).
+                this.staleBaselineDHash = this.lastSampleDHash;
+                this.lastDHashChangeTs = now;
+                this.hasStaleBaseline = true;
+            }
+            else if (DiffHash.Hamming(this.lastSampleDHash, this.staleBaselineDHash) > MonitorDefaults.FreezeHammingBound)
+            {
+                this.staleBaselineDHash = this.lastSampleDHash;
+                this.lastDHashChangeTs = now;
+            }
+
+            // Trip ONLY when content has been static longer than the freeze timeout — beacon-independent.
+            if ((now - this.lastDHashChangeTs).TotalMilliseconds > this.freezeTimeoutMs)
+            {
                 return (true, "freeze-dhash");
             }
         }
         else
         {
-            // expectMotion=false: do NOT accumulate a freeze window (the branch is disabled, D-11).
+            // expectMotion=false: do NOT accumulate a freeze window or staleness baseline (branch disabled, D-11).
             this.ClearHashWindow();
+            this.ClearStaleness();
         }
 
         return (false, string.Empty);
@@ -827,26 +866,20 @@ public sealed class FrameMonitor : IDisposable
         this.hashRingNext = 0;
     }
 
-    // The window is FROZEN only when it is FULL and every hash is within the global Hamming bound of the
-    // newest (D-07 — a freeze candidate needs the WHOLE window to agree, not a single repeat).
-    private bool HashWindowFrozen()
+    // 03-05 (VAL-04): reset the content-staleness baseline so a swapped page / disabled branch re-establishes
+    // its first content sample as the fresh staleness origin (a stale prior-page baseline must never carry).
+    private void ClearStaleness()
     {
-        if (this.hashRingCount < FreezeWindowSize)
-        {
-            return false;
-        }
-
-        var newest = this.hashRing[(this.hashRingNext - 1 + FreezeWindowSize) % FreezeWindowSize];
-        for (var i = 0; i < FreezeWindowSize; i++)
-        {
-            if (DiffHash.Hamming(newest, this.hashRing[i]) > MonitorDefaults.FreezeHammingBound)
-            {
-                return false;
-            }
-        }
-
-        return true;
+        this.lastDHashChangeTs = DateTime.MinValue;
+        this.staleBaselineDHash = 0;
+        this.hasStaleBaseline = false;
     }
+
+    // (03-05 VAL-04) The legacy whole-window-identical freeze helper (HashWindowFrozen) was RETIRED: it tripped
+    // on a fixed 5-sample (1.0s) window, far shorter than a radar's legitimate idle-hold (3.6s–17.8s), and was
+    // only suppressed by an unreliable beacon — the VAL-04 false-trip. The content-staleness TIMER in Classify
+    // (trip when content static > freezeTimeoutMs, beacon-independent) replaced it. The dHash ring is retained
+    // as warm telemetry (PushHash) for the SampleObserved seam and any future window-based diagnostics.
 
     // Copy the latest published front buffer into a managed array for detection (D-05 — the detectors read
     // a COPY, never the live pinned buffer mid-swap and never the callback-scoped CEF pointer). Returns
@@ -1039,6 +1072,7 @@ public sealed class FrameMonitor : IDisposable
         this.recoveryAttempts = 0;
         this.fallbackReason = string.Empty;
         this.ClearHashWindow();
+        this.ClearStaleness();
         this.Transition(MonitorStatus.Healthy, "recovered:K-out-good-frames-post-refresh");
     }
 
@@ -1067,6 +1101,7 @@ public sealed class FrameMonitor : IDisposable
         lock (this.stateLock)
         {
             this.ClearHashWindow();
+            this.ClearStaleness();
             this.badRun = 0;
             this.goodRun = 0;
             this.recoveryAttempts = 0;
