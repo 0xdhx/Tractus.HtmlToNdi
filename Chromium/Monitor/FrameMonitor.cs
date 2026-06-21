@@ -273,19 +273,25 @@ public sealed class FrameMonitor : IDisposable
     private bool beaconPrevPresent;          // whether the prior tick saw a present (non-absent) beacon.
     private BeaconLiveness beaconState = BeaconLiveness.Absent; // the 3-state surfaced on /health.
 
-    // 03-05 (D-31): the BEACON-TRIP-AUTHORITY flag. VAL-04's v1.0 trip authority is the freezeTimeoutMs
-    // BACKSTOP (D-26, validated by 03-04's idle-gap capture); the liveness beacon is BEST-EFFORT. 03-04 found
-    // the beacon reads False 78/299 while a HEALTHY radar runs, and a False beacon (while expectMotion) feeds
-    // the K-in trip counter (D-25, the `beacon-frozen` branch in Classify below) — so an unreliable beacon
-    // could FALSE-TRIP the slate over a healthy radar. When this flag is FALSE the `beacon-frozen` branch is
-    // SUPPRESSED (the beacon no longer feeds the trip counter), while UpdateBeaconState still runs and
-    // BeaconAlive/beaconState STAYS surfaced on /health as pure telemetry (the flag gates ONLY the
-    // trip-feed, never the telemetry). The dHash+paint-age backstop is then the sole freeze-trip path. The
-    // --accuweather-validate gate (Program.cs) honors the D-31 DISABLE-ON-FALSE-TRIP guard: if the beacon
-    // false-trips over the real idle-hold it sets this OFF and re-validates the system holds on the backstop
-    // ALONE. Default TRUE so the beacon stays a best-effort fast-trip bonus unless a false-trip is observed;
-    // deep A4 beacon re-validation is backlog (2026-06-20-beacon-a4-validation-gate-render-robustness.md).
-    private volatile bool beaconTripEnabled = true;
+    // 03-05 (D-31, VECTOR-2 fix): the BEACON-TRIP-AUTHORITY flag. VAL-04's v1.0 trip authority is the
+    // VECTOR-1 content-staleness timer (the freeze-dhash backstop in Classify below); the liveness beacon is
+    // BEST-EFFORT. 03-04/03-05 found the beacon reads not-`True` ~43% over a HEALTHY radar (false 265/899 in
+    // the Baton Rouge 180s capture), and a False beacon (while expectMotion) feeds the K-in trip counter
+    // (D-25, the `beacon-frozen` branch in Classify below) — so an unreliable beacon FALSE-TRIPS the slate
+    // over a healthy radar (the live VAL-04 `beacon-frozen` false-trip). When this flag is FALSE the
+    // `beacon-frozen` branch is SUPPRESSED (the beacon no longer feeds the trip counter), while
+    // UpdateBeaconState still runs and BeaconAlive/beaconState STAYS surfaced on /health as pure telemetry
+    // (the flag gates ONLY the trip-feed, never the telemetry).
+    //
+    // v1.0 ships BACKSTOP-ONLY — beacon-trip default OFF. The content-staleness timer (VECTOR 1) is the freeze
+    // authority; the beacon stays /health telemetry. This is the config the green --accuweather-validate gate
+    // validated holds over the healthy radar, so production = the validated config (no validation-vs-production
+    // divergence). Re-enable the beacon-trip default ONLY when beacon-A4 reliability is proven — backlog
+    // 2026-06-20-beacon-a4-validation-gate-render-robustness.md. The --accuweather-validate gate (Program.cs)
+    // explicitly ENABLES the beacon trip at the start of its VAL-04 phase to PROBE beacon reliability, then
+    // honors the D-31 DISABLE-ON-FALSE-TRIP guard (observe a false-trip → set this OFF → re-validate the system
+    // holds on the backstop ALONE) — so the probe stays meaningful even though production now defaults OFF.
+    private volatile bool beaconTripEnabled = false;
 
     // ── 03-03 (D-24) read-only SampleObserved telemetry-out seam ──
     // Plan 04's D-07 capture + the BeaconClassify tests observe the monitor's per-sample internal decision
@@ -365,13 +371,15 @@ public sealed class FrameMonitor : IDisposable
     public string FallbackReason { get { lock (this.stateLock) { return this.fallbackReason; } } }
 
     /// <summary>
-    /// 03-05 (D-31): the beacon-trip-authority gate. When <c>true</c> (default) a FROZEN beacon while
+    /// 03-05 (D-31, VECTOR-2 fix): the beacon-trip-authority gate. When <c>true</c> a FROZEN beacon while
     /// motion is expected feeds the K-in trip counter as the best-effort fast-trip signal; when <c>false</c>
-    /// the <c>beacon-frozen</c> branch in <see cref="Classify"/> is SUPPRESSED and the freezeTimeoutMs
-    /// backstop is the sole freeze-trip authority (D-26). Either way the beacon keeps ticking and
-    /// <see cref="HealthSnapshot.BeaconAlive"/> stays surfaced on <c>/health</c> as telemetry — this flag
-    /// gates ONLY the trip-feed, never the observability. The <c>--accuweather-validate</c> gate sets this
-    /// OFF if the beacon false-trips over the radar's real idle-hold (the D-31 disable-on-false-trip guard).
+    /// (the v1.0 production DEFAULT — backstop-only) the <c>beacon-frozen</c> branch in <see cref="Classify"/>
+    /// is SUPPRESSED and the content-staleness timer (VECTOR 1) is the sole freeze-trip authority. Either way
+    /// the beacon keeps ticking and <see cref="HealthSnapshot.BeaconAlive"/> stays surfaced on <c>/health</c>
+    /// as telemetry — this flag gates ONLY the trip-feed, never the observability. Production defaults OFF
+    /// (the ~57%-reliable beacon false-trips a healthy radar); the <c>--accuweather-validate</c> gate
+    /// explicitly turns this ON to PROBE the beacon, then sets it OFF again if the beacon false-trips over the
+    /// radar's real idle-hold (the D-31 disable-on-false-trip guard).
     /// </summary>
     public bool BeaconTripEnabled
     {

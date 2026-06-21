@@ -1494,9 +1494,17 @@ public class Program
                 // ════════════════════════════════ VAL-04 — no-false-trip + D-31 guard ════════════════════
                 // BEFORE the destructive blank/freeze faults: observe the radar's REAL idle-hold and assert
                 // the monitor does NOT false-trip while a HEALTHY radar self-throttles. The v1.0 trip authority
-                // is the freezeTimeoutMs backstop (D-26); the beacon is best-effort. If the beacon false-trips
-                // over the idle-hold (03-04 saw False 78/299), the D-31 guard sets BeaconTripEnabled OFF and we
-                // RE-VALIDATE that the system holds on the backstop ALONE.
+                // is the content-staleness timer (VECTOR 1, backstop); the beacon is best-effort. If the beacon
+                // false-trips over the idle-hold (the live capture saw not-`True` ~43%), the D-31 guard sets
+                // BeaconTripEnabled OFF and we RE-VALIDATE that the system holds on the backstop ALONE.
+                //
+                // VECTOR-2 fix: production now DEFAULTS BeaconTripEnabled=OFF (backstop-only — FrameMonitor.cs),
+                // so the gate must OPT INTO the beacon probe explicitly to keep the beacon-reliability probe
+                // meaningful. Enable it here at the start of the VAL-04 phase; the observe-false-trip → disable
+                // (below) → recover → re-validate-backstop-only logic is UNCHANGED. Net: v1.0 ships backstop-only
+                // regardless of the probe outcome (D-31); the gate still exercises + reports the beacon probe.
+                monitor!.BeaconTripEnabled = true;
+
                 var idleDeadline = DateTime.UtcNow.AddSeconds(IdleHoldObserveSeconds);
                 var falseTripped = await PollConditionAsync(
                     () => monitor!.OutputState == FrameMonitor.Output.Fallback,
