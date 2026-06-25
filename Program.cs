@@ -698,16 +698,20 @@ public class Program
         {
             var snapshot = monitor.SnapshotHealth();
 
-            // Sibling probe: read the three page proof markers off the MAIN frame (each null on a miss).
+            // Sibling probe: read the page proof markers off the MAIN frame (each null on a miss).
             var targetPresent = await ReadMainBoolAsync(browserWrapper, "__xpnTargetPresent");
             var consentDismissed = await ReadMainBoolAsync(browserWrapper, "__xpnConsentDismissed");
             var playStarted = await ReadMainBoolAsync(browserWrapper, "__xpnPlayStarted");
+            // 03.1 (INJ-05/D-06): the chrome-hide proof marker — null-on-miss (D-18). Normal-server observable
+            // only; the --accuweather-validate gate proves it in-process via PollMainFlagAsync (D-17).
+            var chromeHidden = await ReadMainBoolAsync(browserWrapper, "__xpnChromeHidden");
 
             return snapshot with
             {
                 TargetPresent = targetPresent,
                 ConsentDismissed = consentDismissed,
                 PlayStarted = playStarted,
+                ChromeHidden = chromeHidden,
             };
         }).WithOpenApi();
 
@@ -1477,6 +1481,33 @@ public class Program
                     return;
                 }
 
+                // 03.1 (INJ-05 / D-06): the FIFTH proof marker — chromeHidden. The recipe's hideChrome() set
+                // __xpnChromeHidden true ONLY after .basic-header resolved AND getComputedStyle display:none.
+                // On the operator market URL .basic-header is known-present, so a persistent false here is a
+                // RECIPE-DRIFT signal the gate fails LOUD on (never a silent pass). This is the IN-PROCESS proof
+                // of chromeHidden (D-17) — NOT a curl :9999/health read (this gate run is ASP.NET-free).
+                if (!await PollMainFlagAsync(browserWrapper, "window.__xpnChromeHidden === true", readyDeadline))
+                {
+                    Console.WriteLine("ACCUWEATHER-VALIDATE FAIL (INJ-05): chromeHidden never true (.basic-header not hidden — recipe drift).");
+                    Log.Error("ACCUWEATHER-VALIDATE FAIL — INJ-05 chromeHidden.");
+                    return;
+                }
+
+                // 03.1 (D-19): SPA-survival PROVEN, not inferred. Force a soft-reload/remount (re-navigate to the
+                // SAME url with the SAME recipe — the doc-start injection re-fires on the fresh document, exactly
+                // the INJ-01 navigation-re-fire path RunInjectSmoke uses), then RE-POLL chromeHidden==true against
+                // a fresh deadline. This closes ROADMAP criterion 1 "surviving SPA re-render" for the AccuWeather
+                // recipe (the --inject-smoke __xpnRemountNow harness already proves the observer machinery
+                // generically). A failure to reassert after remount fails the gate LOUD.
+                await browserWrapper.SetUrlAsync(startUrl, recipe);
+                var remountDeadline = DateTime.UtcNow.AddSeconds(LiveReadyTimeoutSeconds);
+                if (!await PollMainFlagAsync(browserWrapper, "window.__xpnChromeHidden === true", remountDeadline))
+                {
+                    Console.WriteLine("ACCUWEATHER-VALIDATE FAIL (INJ-05): chromeHidden did NOT reassert after SPA remount (D-19 — observer re-assert broken).");
+                    Log.Error("ACCUWEATHER-VALIDATE FAIL — INJ-05 chromeHidden D-19 SPA-remount re-poll.");
+                    return;
+                }
+
                 // non-blank = the monitor is HEALTHY + Live (a blank frame trips it to Fallback, so Live ⇒
                 // non-blank on air). This is the FOURTH marker — required ALONGSIDE the three JS markers.
                 if (!await PollConditionAsync(
@@ -1488,8 +1519,8 @@ public class Program
                     return;
                 }
 
-                Console.WriteLine("ACCUWEATHER-VALIDATE VAL-01 OK — consentDismissed AND targetPresent AND playStarted AND non-blank (all four).");
-                Log.Information("ACCUWEATHER-VALIDATE VAL-01 passed (all four proof-markers).");
+                Console.WriteLine("ACCUWEATHER-VALIDATE VAL-01 OK — consentDismissed AND targetPresent AND playStarted AND chromeHidden (incl. D-19 SPA-remount re-poll) AND non-blank (all five).");
+                Log.Information("ACCUWEATHER-VALIDATE VAL-01 passed (all five proof-markers, chromeHidden re-asserted after SPA remount).");
 
                 // ════════════════════════════════ VAL-04 — no-false-trip + D-31 guard ════════════════════
                 // BEFORE the destructive blank/freeze faults: observe the radar's REAL idle-hold and assert

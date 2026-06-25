@@ -182,6 +182,18 @@ public sealed record HealthSnapshot
     [JsonPropertyName("playStarted")]
     public bool? PlayStarted { get; init; }
 
+    /// <summary>
+    /// 03.1 D-06 (INJ-05/VAL-01): whether the recipe's chrome-hide landed — <c>.basic-header</c> resolved AND
+    /// computed <c>display:none</c>. Composed at <c>/health</c> by the SIBLING CDP probe reading
+    /// <c>window.__xpnChromeHidden</c> (set by the recipe js's <c>hideChrome()</c>) — NOT FrameMonitor.
+    /// Serializes as <c>"chromeHidden":null</c> on a read miss / non-AccuWeather recipe / cold path (D-18 —
+    /// NOT "absent": there is no <c>WhenWritingNull</c>/<c>DefaultIgnoreCondition</c> in the tree, so the field
+    /// is present-with-null, exactly like the sibling markers above). OBSERVABILITY ONLY — never wired into
+    /// UseFallback (it strobes on SPA re-render; auto-acting on it would flap the fallback, D-14).
+    /// </summary>
+    [JsonPropertyName("chromeHidden")]
+    public bool? ChromeHidden { get; init; }
+
     /// <summary>The {ts, reason} shape of the most recent state transition.</summary>
     public sealed record TransitionInfo
     {
