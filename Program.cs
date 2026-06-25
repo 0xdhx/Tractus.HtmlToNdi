@@ -502,6 +502,18 @@ public class Program
             isolationPostureStr,
             healthProcessStart);
 
+        // 03.1 MOUNT-RECOVERY (targetpresent-cold-flake cycle 3): the NET-NEW production recovery — the SAME
+        // control-layer recovery the --accuweather-validate gate runs (RecoverTargetMountAsync). On the
+        // ~15-20% cold flake the SPA never mounts the recipe's targetSelector (#cityRadar) on startup, so
+        // targetPresent never latches and the radar never appears on air (the slate would stick with NO
+        // recovery — production previously read targetPresent ONLY at /health, never for recovery). This
+        // fire-and-forget watcher (CEF-agnostic — it lives at the composition root, NOT in FrameMonitor)
+        // re-navigates via the D-19 SetUrlAsync soft-remount when the target is absent past the threshold,
+        // bounded + LOUD, while FrameMonitor holds the slate. No-op when the startup recipe has no
+        // targetSelector (pass-through pages). Cancelled at shutdown so it never outlives the host.
+        var mountRecoveryCts = new System.Threading.CancellationTokenSource();
+        _ = Task.Run(() => RecoverTargetMountAsync(browserWrapper, startUrl, startupRecipe, mountRecoveryCts.Token));
+
         var capabilitiesXml = $$"""<ndi_capabilities ntk_kvm="true" />""";
         capabilitiesXml += "\0";
         var capabilitiesPtr = UTF.StringToUtf8(capabilitiesXml);
@@ -716,6 +728,9 @@ public class Program
         }).WithOpenApi();
 
         app.Run();
+
+        // 03.1 mount-recovery: stop the startup target-mount watcher (no-op if it already returned).
+        mountRecoveryCts.Cancel();
 
         running = false;
         thread.Join();
@@ -1442,6 +1457,25 @@ public class Program
                 monitor.SetFallbackFrame(fallbackResult.Frame.Bgra, fallbackResult.Frame.Width, fallbackResult.Frame.Height);
 
                 monitor.ApplyRecipe(recipe);
+
+                // 03.1 (mount-recovery cycle 3 — GATE-PARITY with production): subscribe RecipeSwapped →
+                // monitor.Reset so a SetUrlAsync re-nav (the D-19 chromeHidden re-poll AND the new mount-
+                // recovery soft-remount) clears the monitor's stale recovery/exhaustion state and re-classifies
+                // the freshly-loaded document Healthy/Live (Pitfall P-5). The PRODUCTION composition root has
+                // always wired this (Program.cs ~L476); the gate was missing it, so on a caught cold flake the
+                // monitor — having churned its own pixel-recovery to RecoveryExhausted over the absent-radar
+                // window — never returned to Live after the mount-recovery latched targetPresent, failing the
+                // non-blank check. Wiring it makes the gate faithfully mirror production (the gate "stands up the
+                // SAME composition root") and lets the gate verify mount-recovery end-to-end. Mirrors L476:
+                // reset the monitor AND reload the fallback asset for the (same) recipe on every swap.
+                browserWrapper.RecipeSwapped += swapped =>
+                {
+                    monitor!.Reset(swapped);
+                    var swappedFallback = fallbackProvider.LoadOrGenerate(swapped?.FallbackPolicy, swapped?.FallbackAsset);
+                    monitor!.SetFallbackFrame(
+                        swappedFallback.Frame.Bgra, swappedFallback.Frame.Width, swappedFallback.Frame.Height);
+                };
+
                 monitor.WireHealth(
                     () => pump.FramesSent,
                     () => browserWrapper.CurrentRecipe?.UrlMatch,
@@ -1468,6 +1502,15 @@ public class Program
                     Log.Error("ACCUWEATHER-VALIDATE FAIL — VAL-01 consentDismissed.");
                     return;
                 }
+
+                // 03.1 MOUNT-RECOVERY (targetpresent-cold-flake cycle 3): the CONTROL-LAYER recovery, shared with
+                // production. On the ~15-20% cold flake the SPA never mounts #cityRadar (root cause confirmed
+                // cycle 2), so targetPresent never latches. Watch it; if absent past MountRecoveryThresholdMs,
+                // re-nav via the D-19 SetUrlAsync soft-remount (fresh document → fresh mount attempt), bounded +
+                // LOUD. This runs BEFORE the targetPresent poll below so a flaked mount is recovered first; if
+                // recovery is exhausted the existing poll then fails LOUD with its established FAIL line.
+                await RecoverTargetMountAsync(browserWrapper, startUrl, recipe);
+
                 if (!await PollMainFlagAsync(browserWrapper, "window.__xpnTargetPresent === true", readyDeadline))
                 {
                     Console.WriteLine("ACCUWEATHER-VALIDATE FAIL (VAL-01): targetPresent never true (right-content guard — non-blank alone does NOT pass).");
@@ -3525,6 +3568,142 @@ public class Program
             }
 
             await Task.Delay(100);
+        }
+
+        return false;
+    }
+
+    // ── 03.1 MOUNT-RECOVERY (targetpresent-cold-flake, cycle 3) ─────────────────────────────────────
+    // The control-layer recovery for the CONFIRMED cold flake: on ~15-20% of cold loads the live SPA never
+    // mounts the recipe's targetSelector (#cityRadar) into the DOM — querySelector returns null the entire
+    // budget, so the InjectHook rect-proof's `if(!t)→__xpnTargetPresent=false` branch fires every tick and
+    // targetPresent never latches (root cause confirmed cycle 2: el=ABSENT on every false tick, el=PRESENT
+    // never; a layout/unhide/map-init fix is ELIMINATED — the element is not in the DOM at all). The fix gives
+    // the SPA a FRESH mount attempt: when targetPresent is ABSENT past MountRecoveryThresholdMs, re-navigate
+    // via the EXISTING D-19 SetUrlAsync(startUrl, recipe) soft-remount (re-fires doc-start injection on a fresh
+    // document), then re-watch — bounded to MountRecoveryMaxAttempts, LOGGING each attempt, FAIL LOUD after N.
+    //
+    // SHARED SEAM (CONTROL-LAYER): both the interactive --url= production path AND the --accuweather-validate
+    // gate start this against the SAME browserWrapper + recipe right after InitializeWrapperAsync — so the
+    // recovery reaches BOTH. This is NET-NEW production behavior (production previously tracked targetPresent
+    // ONLY at /health as read-only observability, never for recovery — see the SEAM note in the debug file).
+    // The slate covers the screen during the window: FrameMonitor blank/freeze flips to fallback while the
+    // radar is absent, and the radar cuts in once it mounts+paints (D-14 hysteresis).
+    //
+    // NOT touched: hideChrome (proven innocent, D-16 band removal stays), the InjectHook rect-proof, the
+    // FrameMonitor pixel-recovery state machine (orthogonal — that recovers blank/freeze; THIS recovers a
+    // never-mounted target the pixel path cannot see).
+
+    /// <summary>
+    /// 03.1 (mount-recovery): the absent-target threshold before the FIRST re-nav. Healthy cold loads mount
+    /// the target in ~1s; 12s is &gt;10× that, so a healthy load NEVER triggers a re-nav (no false-trigger),
+    /// while still leaving room for <see cref="MountRecoveryMaxAttempts"/> attempts inside the gate's 90s
+    /// LiveReadyTimeoutSeconds budget. Same threshold gates the re-watch window between attempts.
+    /// </summary>
+    private const int MountRecoveryThresholdMs = 12000;
+
+    /// <summary>
+    /// 03.1 (mount-recovery): bounded re-nav attempts before conceding (FAIL LOUD). Matches
+    /// <see cref="FrameMonitor.DefaultMaxRefreshAttempts"/>=3 — with a ~15-20% per-attempt miss, 3
+    /// INDEPENDENT fresh-document mount attempts drop the residual miss to ~0.2^3 ≈ 0.8%. After N the caller's
+    /// own targetPresent poll fails its existing LOUD assertion (gate) / production holds the slate via
+    /// FrameMonitor + logs the exhaustion (the v2 supervisor watchdog escalation is out of scope, D-user).
+    /// </summary>
+    private const int MountRecoveryMaxAttempts = 3;
+
+    /// <summary>
+    /// 03.1 mount-recovery (targetpresent-cold-flake cycle 3). Watches <c>window.__xpnTargetPresent</c> on the
+    /// MAIN frame; when it stays absent (false/unset) for <see cref="MountRecoveryThresholdMs"/>, issues a D-19
+    /// soft-remount (<see cref="CefWrapper.SetUrlAsync"/> with the SAME url+recipe — re-fires doc-start
+    /// injection on a fresh document, the SPA's new mount attempt), then re-watches. Bounded to
+    /// <see cref="MountRecoveryMaxAttempts"/> re-navs; LOGS each attempt; returns when targetPresent latches
+    /// true (recovered/healthy) or the attempts are exhausted (logs LOUD, returns false).
+    ///
+    /// <para>NO-OP when the recipe has no <see cref="Recipe.TargetSelector"/> (a pass-through recipe has no
+    /// target to watch) — returns immediately so non-radar pages are unaffected. Self-contained / fire-and-
+    /// forget-safe: every CDP read is the existing <see cref="ReadMainBoolAsync"/> (short-timeout, null on
+    /// miss), so a slow/hung page degrades to "absent" and is recovered, never stalls.</para>
+    /// </summary>
+    /// <param name="wrapper">The shared CefWrapper (both the gate and production pass the composition-root one).</param>
+    /// <param name="startUrl">The live URL to re-navigate to (the operator URL — same as the initial Load).</param>
+    /// <param name="recipe">The active recipe (re-registered on the fresh document by SetUrlAsync's same-recipe path).</param>
+    /// <param name="cancel">Optional cancellation (production passes the host lifetime so a shutdown stops the watcher).</param>
+    /// <returns>true once targetPresent latched; false if the bounded re-navs were exhausted without a latch.</returns>
+    private static async Task<bool> RecoverTargetMountAsync(
+        CefWrapper wrapper,
+        string startUrl,
+        Recipe? recipe,
+        System.Threading.CancellationToken cancel = default)
+    {
+        // No target selector → nothing to watch (pass-through recipe). Never re-nav a page with no radar.
+        if (recipe is null || string.IsNullOrWhiteSpace(recipe.TargetSelector))
+        {
+            return true;
+        }
+
+        var attempts = 0;
+        while (!cancel.IsCancellationRequested)
+        {
+            // Watch targetPresent for up to the threshold. Latched true within the window → done (healthy or
+            // recovered). Still absent at the deadline → escalate a re-nav (if attempts remain).
+            var watchDeadline = DateTime.UtcNow.AddMilliseconds(MountRecoveryThresholdMs);
+            while (DateTime.UtcNow < watchDeadline)
+            {
+                if (cancel.IsCancellationRequested)
+                {
+                    return false;
+                }
+
+                var present = await ReadMainBoolAsync(wrapper, "__xpnTargetPresent");
+                if (present == true)
+                {
+                    if (attempts > 0)
+                    {
+                        Log.Information(
+                            "MOUNT-RECOVERY recovered — __xpnTargetPresent latched after {Attempts} re-nav attempt(s) (target={Target}).",
+                            attempts, recipe.TargetSelector);
+                    }
+
+                    return true;
+                }
+
+                try
+                {
+                    await Task.Delay(250, cancel);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false; // shutdown — stop the watcher cleanly (fire-and-forget safe).
+                }
+            }
+
+            // Threshold elapsed with the target still absent. Re-nav if we have attempts left; else FAIL LOUD.
+            if (attempts >= MountRecoveryMaxAttempts)
+            {
+                Log.Error(
+                    "MOUNT-RECOVERY EXHAUSTED — __xpnTargetPresent never latched after {Attempts} re-nav attempt(s) "
+                    + "(target={Target}, thresholdMs={Threshold}). The SPA failed to mount the target on every fresh "
+                    + "document; the slate is held by FrameMonitor. (targetpresent-cold-flake.)",
+                    attempts, recipe.TargetSelector, MountRecoveryThresholdMs);
+                return false;
+            }
+
+            attempts++;
+            Log.Warning(
+                "MOUNT-RECOVERY re-nav #{Attempt}/{Max} — __xpnTargetPresent absent for {Threshold}ms (target={Target}); "
+                + "issuing D-19 SetUrlAsync soft-remount to re-fire doc-start injection on a fresh document.",
+                attempts, MountRecoveryMaxAttempts, MountRecoveryThresholdMs, recipe.TargetSelector);
+
+            try
+            {
+                // The D-19 soft-remount: same url+recipe → re-registers doc-start injection on a fresh
+                // document (the SPA's new mount attempt) and raises RecipeSwapped → FrameMonitor.Reset.
+                await wrapper.SetUrlAsync(startUrl, recipe);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "MOUNT-RECOVERY re-nav #{Attempt} SetUrlAsync threw — continuing to re-watch.", attempts);
+            }
         }
 
         return false;
