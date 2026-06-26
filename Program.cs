@@ -135,7 +135,7 @@ public class Program
             // stands up the SAME single-authority composition root the interactive --url=/--recipe path uses
             // (CefWrapper + FrameMonitor + FramePump + NDI send + a real ASP.NET-free in-process /health read
             // via SnapshotHealth + the sibling proof-marker probe), SELF-DRIVES the live AccuWeather recipe,
-            // runs a four-point ENV PRE-ASSERTION (D-06/D-19, FORK-04 §6 shape), then asserts VAL-01 (all four
+            // runs a four-point ENV PRE-ASSERTION (D-06/D-19, FORK-04 §6 shape), then asserts VAL-01 (all five
             // proof-markers), VAL-03 (blank + a genuine all-stop freeze → fallback whose on-air frame MATCHES
             // the slate.png signature, D-29b/D-31), and VAL-04 (no false-trip over the live idle-hold; the
             // freezeTimeoutMs backstop is the v1.0 trip authority, the beacon best-effort behind the D-31
@@ -1216,8 +1216,8 @@ public class Program
     /// equivalent of the FORK-04 §6 <c>query session</c> check); (3) the configured slate.png + accuweather.json
     /// are IN the bundle; (4) the provenance stamp reads CefSharp=148.0.90.0.</para>
     ///
-    /// <para>VAL-01 = consentDismissed AND targetPresent AND playStarted AND non-blank — ALL FOUR (D-06:
-    /// non-blank ALONE must NOT pass; it passes on WRONG content — targetPresent is the right-content guard).
+    /// <para>VAL-01 = consentDismissed AND targetPresent AND playStarted AND chromeHidden AND non-blank — ALL FIVE
+    /// (D-06/D-16: non-blank ALONE must NOT pass; it passes on WRONG content — targetPresent is the right-content guard).
     /// VAL-03 = SetUrlAsync(about:blank) → source=fallback + fallbackReason=blank-* + fallbackAsset=configured
     /// AND the on-air faulted frame MATCHES the slate.png signature (D-29b — not merely non-blank geometry),
     /// THEN a GENUINE all-stop freeze (a static page whose OnPaint stops) trips the freezeTimeoutMs BACKSTOP →
@@ -1487,11 +1487,11 @@ public class Program
                 await browserWrapper.InitializeWrapperAsync();
 
                 // ════════════════════════════════ VAL-01 — content proof ════════════════════════════════
-                // ALL FOUR proof-markers (D-06). non-blank ALONE must NOT pass (it passes on WRONG content) —
-                // targetPresent is the right-content guard. consentDismissed/targetPresent/playStarted come
-                // from the page JS via the sibling probe (ReadMainBoolAsync — the SAME read /health composes);
+                // ALL FIVE proof-markers (D-06/D-16). non-blank ALONE must NOT pass (it passes on WRONG content) —
+                // targetPresent is the right-content guard. consentDismissed/targetPresent/playStarted/chromeHidden
+                // come from the page JS via the sibling probe (ReadMainBoolAsync — the SAME read /health composes);
                 // non-blank comes from the monitor (HEALTHY + Live = a non-blank frame is on air, since BLANK
-                // trips the monitor to Fallback). We require all four TOGETHER, not non-blank alone.
+                // trips the monitor to Fallback). We require all five TOGETHER, not non-blank alone.
                 var readyDeadline = DateTime.UtcNow.AddSeconds(LiveReadyTimeoutSeconds);
 
                 // The three JS markers (each polled true on the MAIN frame). targetPresent is the right-content
@@ -1552,7 +1552,8 @@ public class Program
                 }
 
                 // non-blank = the monitor is HEALTHY + Live (a blank frame trips it to Fallback, so Live ⇒
-                // non-blank on air). This is the FOURTH marker — required ALONGSIDE the three JS markers.
+                // non-blank on air). This is the FIFTH marker — required ALONGSIDE the four JS markers
+                // (consentDismissed/targetPresent/playStarted/chromeHidden).
                 if (!await PollConditionAsync(
                     () => monitor!.Status == MonitorStatus.Healthy && monitor!.OutputState == FrameMonitor.Output.Live,
                     readyDeadline))
@@ -1708,7 +1709,7 @@ public class Program
                 Console.WriteLine($"ACCUWEATHER-VALIDATE VAL-03 (freeze) OK — a genuine all-stop freeze tripped to fallback via the freezeTimeoutMs={recipe.FreezeTimeoutMs} backstop (D-31; not beacon-dependent).");
                 Log.Information("ACCUWEATHER-VALIDATE VAL-03 freeze passed — backstop trip (freezeTimeoutMs={Freeze}).", recipe.FreezeTimeoutMs);
 
-                Console.WriteLine("ACCUWEATHER-VALIDATE OK — VAL-01 (all four markers) + VAL-03 (blank+freeze→slate-signature fallback) + VAL-04 (no false-trip / D-31 backstop-alone) all passed via the existing control plane (no new endpoint).");
+                Console.WriteLine("ACCUWEATHER-VALIDATE OK — VAL-01 (all five markers) + VAL-03 (blank+freeze→slate-signature fallback) + VAL-04 (no false-trip / D-31 backstop-alone) all passed via the existing control plane (no new endpoint).");
                 Log.Information("ACCUWEATHER-VALIDATE OK — full live content-proof passed.");
                 exitCode = 0;
             });
